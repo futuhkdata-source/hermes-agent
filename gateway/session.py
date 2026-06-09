@@ -84,6 +84,7 @@ class SessionSource:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
+    session_anchor_id: Optional[str] = None  # Virtual group-lane anchor (reply resumes without platform threads)
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
@@ -128,6 +129,7 @@ class SessionSource:
             "user_id": self.user_id,
             "user_name": self.user_name,
             "thread_id": self.thread_id,
+            "session_anchor_id": self.session_anchor_id,
             "chat_topic": self.chat_topic,
         }
         if self.user_id_alt:
@@ -154,6 +156,7 @@ class SessionSource:
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
+            session_anchor_id=data.get("session_anchor_id"),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
@@ -618,6 +621,8 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
+    if source.session_anchor_id:
+        return True
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
@@ -718,14 +723,17 @@ def build_session_key(
 
     if source.chat_id:
         key_parts.append(source.chat_id)
-    if source.thread_id:
-        key_parts.append(source.thread_id)
+    lane_id = source.session_anchor_id or source.thread_id
+    if lane_id:
+        key_parts.append(str(lane_id))
 
     # In threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
     isolate_user = group_sessions_per_user
-    if source.thread_id and not thread_sessions_per_user:
+    if source.session_anchor_id:
+        isolate_user = False
+    elif source.thread_id and not thread_sessions_per_user:
         isolate_user = False
 
     if isolate_user and participant_id:

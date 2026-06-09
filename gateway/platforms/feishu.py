@@ -1798,13 +1798,32 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                        raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    if msg_type == "interactive":
+                        logger.warning("[Feishu] Interactive card send failed; falling back to plain text: %s", exc)
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": chunk}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    else:
+                        if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                            raise
+                        logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                if msg_type == "interactive" and not self._response_succeeded(response):
+                    logger.warning("[Feishu] Interactive card rejected by API response; falling back to plain text")
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        payload=json.dumps({"text": chunk}, ensure_ascii=False),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -4373,7 +4392,89 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
+    @staticmethod
+    def _normalize_footer_note_line(line: str) -> str:
+        text = str(line or "").strip()
+        if not text:
+            return ""
+        if "ctx:" in text and " | " not in text:
+            prefix, suffix = text.split("ctx:", 1)
+            left = " | ".join(part for part in prefix.strip().split() if part)
+            right = f"ctx:{suffix.strip()}"
+            right = re.sub(r"\s+(c:\d+|S:\d+%\s+left|W:\d+%\s+left)", r" | \1", right)
+            text = " | ".join(part for part in [left, right] if part)
+        elif " | " not in text and len(text.split()) >= 2:
+            text = " | ".join(part for part in text.split() if part)
+        return text.strip()
+
+    @staticmethod
+    def _looks_like_runtime_footer_block(footer: str) -> bool:
+        probe = str(footer or "").strip()
+        if not probe:
+            return False
+        lowered = probe.lower()
+        hints = (
+            "ctx:",
+            "openai",
+            "openrouter",
+            "anthropic",
+            "codex",
+            "gpt-",
+            "claude",
+            "gemini",
+            "default",
+            "-agent",
+            "c:",
+            "s:",
+            "w:",
+        )
+        return any(token in lowered for token in hints)
+
+    def _build_runtime_footer_card_payload(self, content: str) -> Optional[dict[str, Any]]:
+        text = str(content or "").strip()
+        if not text or "\n\n" not in text:
+            return None
+        body, footer = text.rsplit("\n\n", 1)
+        body = body.strip()
+        footer = footer.strip()
+        if not body or not self._looks_like_runtime_footer_block(footer):
+            return None
+
+        footer_lines = [line.strip() for line in footer.splitlines() if line.strip()]
+        if not footer_lines:
+            return None
+
+        header_title = "Hermes"
+        note_lines: list[str] = []
+        first = footer_lines[0]
+        lowered_first = first.lower()
+        if "ctx:" not in lowered_first and not any(tok in lowered_first for tok in ("gpt-", "claude", "codex", "openai", "openrouter", "anthropic", "gemini")):
+            header_title = f"Hermes · {first}"
+            note_lines = [self._normalize_footer_note_line(line) for line in footer_lines[1:]]
+        else:
+            note_lines = [self._normalize_footer_note_line(line) for line in footer_lines]
+
+        note_lines = [line for line in note_lines if line]
+        if not note_lines:
+            note_lines = [self._normalize_footer_note_line(footer)]
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": header_title[:120]},
+                "template": "blue",
+            },
+            "elements": [
+                {"tag": "markdown", "content": body},
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": "\n".join(note_lines)[:900]}]},
+            ],
+        }
+        return card
+
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        runtime_footer_card = self._build_runtime_footer_card_payload(content)
+        if runtime_footer_card is not None:
+            return "interactive", json.dumps(runtime_footer_card, ensure_ascii=False)
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
         # Force plain text for anything that looks like a markdown table.

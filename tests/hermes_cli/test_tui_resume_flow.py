@@ -1,4 +1,5 @@
 from argparse import Namespace
+import json
 import os
 from pathlib import Path
 import sys
@@ -660,6 +661,55 @@ def test_oneshot_prints_nonempty_final_response(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == "done\n"
     assert captured.err == ""
+
+
+def test_build_oneshot_metadata_captures_ctx_reasoning_and_budget():
+    from hermes_cli.oneshot import _build_oneshot_metadata
+
+    compressor = types.SimpleNamespace(
+        last_prompt_tokens=-1,
+        context_length=200000,
+        compression_count=3,
+    )
+    rl_state = types.SimpleNamespace(has_data=True)
+    agent = types.SimpleNamespace(
+        context_compressor=compressor,
+        reasoning_config={"enabled": True, "effort": "high"},
+        get_rate_limit_state=lambda: rl_state,
+    )
+
+    import agent.rate_limit_tracker as rlt
+
+    original = rlt.format_rate_limit_compact
+    rlt.format_rate_limit_compact = lambda state: "RPM: 5/500"
+    try:
+        payload = _build_oneshot_metadata(agent=agent, model="gpt-test", provider="demo")
+    finally:
+        rlt.format_rate_limit_compact = original
+
+    assert payload == {
+        "model": "gpt-test",
+        "provider": "demo",
+        "reasoning": "high",
+        "context_tokens": 0,
+        "context_length": 200000,
+        "compression_count": 3,
+        "rate_limit_budget": "RPM: 5/500",
+    }
+
+
+def test_write_oneshot_metadata_writes_json_sidecar(monkeypatch, tmp_path):
+    from hermes_cli.oneshot import _write_oneshot_metadata
+
+    target = tmp_path / "oneshot-metadata.json"
+    monkeypatch.setenv("HERMES_ONESHOT_METADATA_PATH", str(target))
+
+    _write_oneshot_metadata({"context_tokens": 123, "context_length": 456})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "context_length": 456,
+        "context_tokens": 123,
+    }
 
 
 def test_oneshot_fails_closed_on_agent_exception(monkeypatch, capsys):

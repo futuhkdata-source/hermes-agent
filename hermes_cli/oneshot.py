@@ -21,11 +21,13 @@ Env var fallbacks (used when the corresponding arg is not passed):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -242,6 +244,77 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _resolve_oneshot_reasoning(agent: Any) -> str | None:
+    cfg = getattr(agent, "reasoning_config", None)
+    if not isinstance(cfg, dict) or cfg.get("enabled") is False:
+        return None
+    value = str(cfg.get("effort") or "").strip()
+    return value or None
+
+
+def _resolve_oneshot_context_snapshot(agent: Any) -> tuple[int, int | None, int | None]:
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return 0, None, None
+
+    context_tokens = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+    if context_tokens < 0:
+        context_tokens = 0
+
+    context_length = int(getattr(compressor, "context_length", 0) or 0)
+    if context_length < 0:
+        context_length = 0
+
+    compression_count = int(getattr(compressor, "compression_count", 0) or 0)
+    if compression_count < 0:
+        compression_count = 0
+
+    return context_tokens, (context_length or None), compression_count
+
+
+def _resolve_oneshot_rate_limit_budget(agent: Any) -> str | None:
+    try:
+        state = agent.get_rate_limit_state()
+    except Exception:
+        return None
+    if not state or not getattr(state, "has_data", False):
+        return None
+    try:
+        from agent.rate_limit_tracker import format_rate_limit_compact
+
+        budget = str(format_rate_limit_compact(state) or "").strip()
+    except Exception:
+        return None
+    return budget or None
+
+
+def _build_oneshot_metadata(*, agent: Any, model: str, provider: str | None) -> dict[str, Any]:
+    context_tokens, context_length, compression_count = _resolve_oneshot_context_snapshot(agent)
+    payload: dict[str, Any] = {
+        "model": str(model or "").strip() or None,
+        "provider": str(provider or "").strip() or None,
+        "reasoning": _resolve_oneshot_reasoning(agent),
+        "context_tokens": context_tokens,
+        "context_length": context_length,
+        "compression_count": compression_count,
+        "rate_limit_budget": _resolve_oneshot_rate_limit_budget(agent),
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def _write_oneshot_metadata(payload: dict[str, Any] | None) -> None:
+    path = str(os.getenv("HERMES_ONESHOT_METADATA_PATH", "") or "").strip()
+    if not path:
+        return
+    try:
+        Path(path).write_text(
+            json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logging.debug("Could not write oneshot metadata %s: %s", path, exc)
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -364,7 +437,15 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    response = agent.chat(prompt) or ""
+    _write_oneshot_metadata(
+        _build_oneshot_metadata(
+            agent=agent,
+            model=effective_model,
+            provider=runtime.get("provider"),
+        )
+    )
+    return response
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

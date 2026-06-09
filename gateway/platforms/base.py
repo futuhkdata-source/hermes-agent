@@ -491,6 +491,10 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.group_reply_session_mode import (
+    record_group_message_anchor,
+    resolve_group_reply_anchor,
+)
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -3923,6 +3927,50 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def _apply_group_reply_session_mode(self, event: MessageEvent) -> MessageEvent:
+        """Normalize Feishu group replies onto message-anchored shared sessions."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return event
+        if getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)) != "feishu":
+            return event
+        if getattr(source, "chat_type", None) != "group":
+            return event
+        message_id = getattr(event, "message_id", None) or getattr(source, "message_id", None)
+        reply_to_message_id = getattr(event, "reply_to_message_id", None)
+        anchor_id = None
+        if reply_to_message_id:
+            anchor_id = resolve_group_reply_anchor(
+                platform=source.platform,
+                chat_type=source.chat_type,
+                chat_id=source.chat_id,
+                reply_to_message_id=str(reply_to_message_id),
+            )
+        if not anchor_id:
+            anchor_id = str(message_id or "").strip() or None
+        if not anchor_id:
+            return event
+        if message_id:
+            try:
+                record_group_message_anchor(
+                    platform=source.platform,
+                    chat_type=source.chat_type,
+                    chat_id=source.chat_id,
+                    message_id=str(message_id),
+                    anchor_id=anchor_id,
+                )
+            except Exception:
+                logger.debug("[%s] Failed to record inbound group message anchor", self.name, exc_info=True)
+        if getattr(source, "session_anchor_id", None) == anchor_id and getattr(source, "thread_id", None) is None:
+            return event
+        new_source = dataclasses.replace(
+            source,
+            thread_id=None,
+            session_anchor_id=anchor_id,
+            message_id=str(message_id) if message_id else getattr(source, "message_id", None),
+        )
+        return dataclasses.replace(event, source=new_source)
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -3940,6 +3988,7 @@ class BasePlatformAdapter(ABC):
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
         self._apply_topic_recovery(event)
+        event = self._apply_group_reply_session_mode(event)
 
         session_key = build_session_key(
             event.source,
@@ -4155,6 +4204,20 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                _msg_id = getattr(result, "message_id", None)
+                _anchor_id = getattr(getattr(event, "source", None), "session_anchor_id", None)
+                _source = getattr(event, "source", None)
+                if _msg_id and _anchor_id and _source is not None:
+                    try:
+                        record_group_message_anchor(
+                            platform=_source.platform,
+                            chat_type=_source.chat_type,
+                            chat_id=_source.chat_id,
+                            message_id=str(_msg_id),
+                            anchor_id=str(_anchor_id),
+                        )
+                    except Exception:
+                        logger.debug("[%s] Failed to record outbound group message anchor", self.name, exc_info=True)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).

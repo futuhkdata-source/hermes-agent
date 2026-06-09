@@ -4,9 +4,11 @@ appended to final gateway replies."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
+import gateway.runtime_footer as runtime_footer
 from gateway.runtime_footer import (
     _home_relative_cwd,
     _model_short,
@@ -67,7 +69,7 @@ def test_format_footer_all_fields(monkeypatch, tmp_path):
         cwd=None,  # falls back to TERMINAL_CWD env var
         fields=("model", "context_pct", "cwd"),
     )
-    assert out == "gpt-5.4 · 68% · ~/projects/hermes"
+    assert out == "gpt-5.4 · ctx 68% · ~/projects/hermes"
 
 
 def test_format_footer_skips_missing_context_length():
@@ -92,7 +94,7 @@ def test_format_footer_context_pct_clamped_to_100():
         cwd="",
         fields=("context_pct",),
     )
-    assert out == "100%"
+    assert out == "ctx 100%"
 
 
 def test_format_footer_context_pct_never_negative():
@@ -124,7 +126,7 @@ def test_format_footer_drops_cwd_when_empty(monkeypatch):
         fields=("model", "context_pct", "cwd"),
     )
     # cwd silently dropped; model + pct remain
-    assert out == "gpt-5.4 · 50%"
+    assert out == "gpt-5.4 · ctx 50%"
 
 
 def test_format_footer_custom_field_order():
@@ -134,7 +136,7 @@ def test_format_footer_custom_field_order():
         cwd="/opt/project",
         fields=("context_pct", "model"),  # swapped + no cwd
     )
-    assert out == "50% · gpt-5.4"
+    assert out == "ctx 50% · gpt-5.4"
 
 
 def test_format_footer_unknown_field_silently_ignored():
@@ -144,7 +146,7 @@ def test_format_footer_unknown_field_silently_ignored():
         cwd="/x",
         fields=("model", "bogus", "context_pct"),
     )
-    assert out == "gpt-5.4 · 50%"
+    assert out == "gpt-5.4 · ctx 50%"
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +155,7 @@ def test_format_footer_unknown_field_silently_ignored():
 
 def test_resolve_defaults_off_empty_config():
     cfg = resolve_footer_config({}, "telegram")
-    assert cfg == {"enabled": False, "fields": ["model", "context_pct", "cwd"]}
+    assert cfg == {"enabled": False, "fields": ["model", "context_pct", "cwd"], "separator": " · "}
 
 
 def test_resolve_global_enable():
@@ -229,6 +231,87 @@ def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
     (tmp_path / "proj").mkdir(exist_ok=True)
     assert "gpt-5.4" in out
     assert "25%" in out
+
+
+def test_build_footer_openai_codex_prefers_account_usage(monkeypatch):
+    monkeypatch.setattr(
+        runtime_footer,
+        "_format_account_budget",
+        lambda provider: "s:4% left | w:9% left" if provider == "openai-codex" else "",
+    )
+    state = SimpleNamespace(
+        tokens_min=SimpleNamespace(limit=100, remaining=88),
+        tokens_hour=SimpleNamespace(limit=1000, remaining=777),
+        requests_min=None,
+        requests_hour=None,
+    )
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["model", "rate_limit_budget"],
+                }
+            }
+        },
+        platform_key="feishu",
+        model="openai/gpt-5.4",
+        provider="openai-codex",
+        context_tokens=10,
+        context_length=100,
+        cwd="/tmp",
+        rate_limit_state=state,
+        rate_limit_budget="RPM: 1/2 | TPM: 3/4",
+    )
+    assert "s:4% left | w:9% left" in out
+    assert "RPM:" not in out
+
+
+def test_format_footer_harrison_compact_feishu_shape():
+    out = format_runtime_footer(
+        model="openai/gpt-5.4",
+        provider="openai-codex",
+        reasoning="medium",
+        context_tokens=37_000,
+        context_length=272_000,
+        fields=(
+            "model",
+            "provider",
+            "thinking",
+            "line_break",
+            "context",
+            "compaction",
+            "rate_limit_budget",
+        ),
+        separator=" | ",
+        compression_count=2,
+        rate_limit_budget="s:99% left | w:98% left",
+    )
+    assert out == (
+        "gpt-5.4 | openai-codex | medium\n"
+        "ctx:37k/272k (14%) | c:2 | s:99% left | w:98% left"
+    )
+
+
+def test_build_footer_non_codex_uses_passed_rate_limit_budget():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["rate_limit_budget"],
+                }
+            }
+        },
+        platform_key="feishu",
+        model="openai/gpt-5.4",
+        provider="openrouter",
+        context_tokens=10,
+        context_length=100,
+        cwd="/tmp",
+        rate_limit_budget="RPM: 7/10 | TPM: 80/100",
+    )
+    assert out == "RPM: 7/10 | TPM: 80/100"
 
 
 def test_build_footer_per_platform_off_suppresses():

@@ -9614,8 +9614,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
+                    provider=agent_result.get("provider"),
+                    profile=os.environ.get("HERMES_PROFILE", "default"),
+                    reasoning=agent_result.get("reasoning") or agent_result.get("reasoning_effort"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    compression_count=agent_result.get("compression_count"),
+                    rate_limit_budget=agent_result.get("rate_limit_budget"),
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:
@@ -15866,17 +15871,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
-            # Extract actual token counts from the agent instance used for this run
+            # Extract actual token counts and runtime metadata from the agent instance used for this run
             _last_prompt_toks = 0
             _input_toks = 0
             _output_toks = 0
             _context_length = 0
+            _compression_count = 0
+            _rate_limit_budget = ""
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _compression_count = getattr(_agent.context_compressor, "compression_count", 0) or 0
+            if _agent and hasattr(_agent, "get_rate_limit_state"):
+                try:
+                    _rl_state = _agent.get_rate_limit_state()
+                    if _rl_state and getattr(_rl_state, "has_data", False):
+                        from agent.rate_limit_tracker import format_rate_limit_compact
+                        _rate_limit_budget = format_rate_limit_compact(_rl_state)
+                except Exception:
+                    _rate_limit_budget = ""
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             # Sync session_id immediately after run_conversation(). Compression
@@ -15955,6 +15971,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "compression_count": _compression_count,
+                    "rate_limit_budget": _rate_limit_budget,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -16054,6 +16072,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "compression_count": _compression_count,
+                "rate_limit_budget": _rate_limit_budget,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
