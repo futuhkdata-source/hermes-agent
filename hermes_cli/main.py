@@ -8492,6 +8492,39 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
+def _run_post_update_recovery_hook() -> bool:
+    """Run an optional local post-update recovery hook.
+
+    Contract:
+    - env override: ``HERMES_POST_UPDATE_HOOK``
+    - default hook: ``$HERMES_HOME/scripts/post-update-recovery.sh``
+
+    The hook is best-effort local hardening for site-specific recovery and
+    smoke tests that should run immediately after ``hermes update`` succeeds
+    but before gateways restart onto the new code.
+    """
+    hook = os.environ.get("HERMES_POST_UPDATE_HOOK")
+    if hook:
+        hook_path = Path(hook).expanduser()
+    else:
+        hook_path = get_hermes_home() / "scripts" / "post-update-recovery.sh"
+
+    if not hook_path.exists():
+        return False
+
+    print()
+    print(f"→ Running post-update recovery hook: {hook_path}")
+    env = os.environ.copy()
+    env.setdefault("HERMES_UPDATE_PROJECT_ROOT", str(PROJECT_ROOT))
+    env.setdefault("HERMES_HOME", str(get_hermes_home()))
+    result = subprocess.run([str(hook_path)], cwd=PROJECT_ROOT, env=env)
+    if result.returncode != 0:
+        print(f"  ⚠ Post-update recovery hook failed with exit code {result.returncode}")
+    else:
+        print("  ✓ Post-update recovery hook complete")
+    return True
+
+
 def _cmd_update_pip(args):
     """Update Hermes via pip (for PyPI installs)."""
     from hermes_cli import __version__
@@ -9366,6 +9399,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 install_cua_driver(upgrade=True)
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)
+
+        try:
+            _run_post_update_recovery_hook()
+        except Exception as e:
+            logger.debug("Post-update recovery hook failed: %s", e)
+            print(f"  ⚠ Post-update recovery hook error: {e}")
 
         # Write exit code *before* the gateway restart attempt.
         # When running as ``hermes update --gateway`` (spawned by the gateway's
