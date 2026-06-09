@@ -750,6 +750,30 @@ class TestSendUpdateNotification:
         assert "finished successfully" in sent_text
 
     @pytest.mark.asyncio
+    async def test_appends_post_update_recovery_summary(self, tmp_path):
+        """Final update notification includes the local recovery summary when present."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "telegram", "chat_id": "111", "user_id": "222"}
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_exit_code").write_text("0")
+        (hermes_home / ".update_post_recovery_summary.txt").write_text(
+            "post-update recovery: PASS\nsmoke_tests_passed=1\n"
+        )
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._send_update_notification()
+
+        sent_text = mock_adapter.send.call_args[0][1]
+        assert "post-update recovery: PASS" in sent_text
+        assert "smoke_tests_passed=1" in sent_text
+
+    @pytest.mark.asyncio
     async def test_cleans_up_files_after_notification(self, tmp_path):
         """Both marker and output files are deleted after notification."""
         runner = _make_runner()
@@ -774,6 +798,7 @@ class TestSendUpdateNotification:
         assert not pending_path.exists()
         assert not output_path.exists()
         assert not exit_code_path.exists()
+        assert not (hermes_home / ".update_post_recovery_summary.txt").exists()
 
     @pytest.mark.asyncio
     async def test_cleans_up_on_error(self, tmp_path):

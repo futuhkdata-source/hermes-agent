@@ -12201,25 +12201,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     exit_code_raw = exit_code_path.read_text().strip() or "1"
                     exit_code = int(exit_code_raw)
+                    recovery_summary = ""
+                    recovery_summary_path = _hermes_home / ".update_post_recovery_summary.txt"
+                    if recovery_summary_path.exists():
+                        try:
+                            recovery_summary = recovery_summary_path.read_text().strip()
+                        except OSError:
+                            recovery_summary = ""
                     if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
-                            "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
+                        msg = "✅ Hermes update finished."
                     else:
-                        await adapter.send(
-                            chat_id,
-                            "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
+                        msg = "❌ Hermes update failed (exit code {}).".format(exit_code)
+                    if recovery_summary:
+                        msg += f"\n\n```\n{recovery_summary}\n```"
+                    await adapter.send(
+                        chat_id,
+                        msg,
+                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                    )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
                     logger.warning("Update final notification failed: %s", e)
 
                 # Cleanup
                 for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
+                          exit_code_path, prompt_path, _hermes_home / ".update_post_recovery_summary.txt"):
                     p.unlink(missing_ok=True)
                 (_hermes_home / ".update_response").unlink(missing_ok=True)
                 self._update_prompt_pending.pop(session_key, None)
@@ -12365,6 +12371,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Resolve adapter
             platform = Platform(platform_str)
             adapter = self.adapters.get(platform)
+            recovery_summary = ""
+            recovery_summary_path = _hermes_home / ".update_post_recovery_summary.txt"
+            if recovery_summary_path.exists():
+                try:
+                    recovery_summary = recovery_summary_path.read_text().strip()
+                except OSError:
+                    recovery_summary = ""
 
             if not adapter and chat_id:
                 # The update finished, but the target platform has not
@@ -12406,6 +12419,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+                if recovery_summary:
+                    msg += f"\n\n```\n{recovery_summary}\n```"
                 await adapter.send(
                     chat_id,
                     msg,
@@ -12425,6 +12440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 claimed_path.unlink(missing_ok=True)
                 output_path.unlink(missing_ok=True)
                 exit_code_path.unlink(missing_ok=True)
+                (_hermes_home / ".update_post_recovery_summary.txt").unlink(missing_ok=True)
 
         return True
 
