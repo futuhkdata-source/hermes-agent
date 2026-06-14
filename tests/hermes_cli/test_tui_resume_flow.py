@@ -663,6 +663,79 @@ def test_oneshot_prints_nonempty_final_response(monkeypatch, capsys):
     assert captured.err == ""
 
 
+def test_oneshot_run_agent_resume_loads_history(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    db.create_session("s1", source="cli", model="m")
+    db.append_message("s1", "user", "old question")
+    db.append_message("s1", "assistant", "old answer")
+
+    captured = {}
+
+    class FakeCompressor:
+        last_prompt_tokens = 12
+        context_length = 200000
+        compression_count = 0
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["session_id"] = kwargs.get("session_id")
+            self.context_compressor = FakeCompressor()
+            self.reasoning_config = None
+
+        def run_conversation(self, prompt, conversation_history=None):
+            captured["prompt"] = prompt
+            captured["history"] = conversation_history
+            return {"final_response": "ok"}
+
+        def chat(self, _prompt):
+            captured["chat_called"] = True
+            return "unexpected"
+
+        def get_rate_limit_state(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        types.SimpleNamespace(
+            resolve_runtime_provider=lambda **_kwargs: {
+                "provider": "fake",
+                "api_key": "k",
+                "base_url": "http://fake",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            }
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        types.SimpleNamespace(detect_provider_for_model=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        types.SimpleNamespace(_get_platform_tools=lambda _cfg, _platform: set()),
+    )
+
+    from hermes_cli.oneshot import _run_agent
+
+    assert _run_agent("new question", model="fake-model", resume_session="s1") == "ok"
+    assert captured["session_id"] == "s1"
+    assert captured["prompt"] == "new question"
+    assert captured["history"] == [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    assert "chat_called" not in captured
+
+
+
 def test_build_oneshot_metadata_captures_ctx_reasoning_and_budget():
     from hermes_cli.oneshot import _build_oneshot_metadata
 

@@ -129,6 +129,7 @@ def run_oneshot(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    resume_session: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -190,6 +191,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    resume_session=resume_session,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -321,6 +323,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    resume_session: Optional[str] = None,
 ) -> str:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns the final response string."""
@@ -401,6 +404,25 @@ def _run_agent(
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     session_db = _create_session_db_for_oneshot()
+    resume_session_id = str(resume_session or "").strip() or None
+    conversation_history = None
+    if resume_session_id:
+        if session_db is None:
+            raise RuntimeError("SQLite session store not available; cannot resume session")
+        resolved_id = session_db.resolve_resume_session_id(resume_session_id)
+        if resolved_id:
+            resume_session_id = resolved_id
+        session_meta = session_db.get_session(resume_session_id)
+        if not session_meta:
+            raise ValueError(f"Session not found: {resume_session_id}")
+        conversation_history = session_db.get_messages_as_conversation(resume_session_id)
+        if not conversation_history:
+            raise ValueError(f"Session {resume_session_id} found but has no messages")
+        try:
+            session_db.reopen_session(resume_session_id)
+        except Exception:
+            logging.debug("Could not reopen resumed oneshot session %s", resume_session_id, exc_info=True)
+
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
@@ -414,6 +436,7 @@ def _run_agent(
         enabled_toolsets=toolsets_list,
         quiet_mode=True,
         platform="cli",
+        session_id=resume_session_id,
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
@@ -437,7 +460,11 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    response = agent.chat(prompt) or ""
+    if conversation_history is not None:
+        result = agent.run_conversation(prompt, conversation_history=conversation_history)
+        response = str(result.get("final_response") or "")
+    else:
+        response = agent.chat(prompt) or ""
     _write_oneshot_metadata(
         _build_oneshot_metadata(
             agent=agent,

@@ -11402,14 +11402,14 @@ def _try_termux_fast_cli_launch() -> bool:
         _prepare_agent_startup(args)
         from hermes_cli.oneshot import run_oneshot
 
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-            )
-        )
+        _oneshot_kwargs = {
+            "model": getattr(args, "model", None),
+            "provider": getattr(args, "provider", None),
+            "toolsets": getattr(args, "toolsets", None),
+        }
+        if getattr(args, "resume", None):
+            _oneshot_kwargs["resume_session"] = getattr(args, "resume", None)
+        sys.exit(run_oneshot(args.oneshot, **_oneshot_kwargs))
 
     if (args.resume or args.continue_last) and args.command is None:
         args.command = "chat"
@@ -12635,14 +12635,14 @@ def main():
     if getattr(args, "oneshot", None):
         from hermes_cli.oneshot import run_oneshot
 
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-            )
-        )
+        _oneshot_kwargs = {
+            "model": getattr(args, "model", None),
+            "provider": getattr(args, "provider", None),
+            "toolsets": getattr(args, "toolsets", None),
+        }
+        if getattr(args, "resume", None):
+            _oneshot_kwargs["resume_session"] = getattr(args, "resume", None)
+        sys.exit(run_oneshot(args.oneshot, **_oneshot_kwargs))
 
     # Handle top-level --resume / --continue as shortcut to chat
     if (args.resume or args.continue_last) and args.command is None:
