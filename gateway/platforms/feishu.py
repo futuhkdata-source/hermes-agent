@@ -227,6 +227,117 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "always": "Approved permanently",
     "deny": "Denied",
 }
+
+
+def _coerce_card_action_value(raw_value: Any) -> Dict[str, Any]:
+    """Normalize Feishu card button values to a dict.
+
+    Lark/Feishu callback payloads are not consistent across SDK versions and
+    delivery modes: a card button ``value`` authored as a JSON object may arrive
+    as a Python dict, a JSON string, or occasionally a small SDK wrapper object.
+    Approval/update buttons depend on keys inside this value; treating non-dict
+    values as empty makes those clicks fall through to the generic ``/card``
+    synthetic-command path and leaves the waiting approval unresolved.
+    """
+    if isinstance(raw_value, dict):
+        return raw_value
+    if raw_value is None:
+        return {}
+    if isinstance(raw_value, (bytes, bytearray)):
+        try:
+            raw_value = raw_value.decode("utf-8")
+        except Exception:
+            return {}
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    # Webhook normalization can recursively convert the button value dict itself
+    # into a SimpleNamespace-like object (e.g. namespace(approval_id='1',
+    # hermes_action='approve_once')). Convert that shallow public attribute bag
+    # back to a dict before falling through to wrapper-style recursion.
+    try:
+        public_attrs = {
+            key: value
+            for key, value in vars(raw_value).items()
+            if isinstance(key, str) and not key.startswith("_")
+        }
+    except TypeError:
+        public_attrs = {}
+    if public_attrs:
+        return public_attrs
+    # Some SDK model classes expose the JSON value under an attribute while the
+    # action itself also has a ``value`` field. Recurse once through the common
+    # shapes without walking arbitrary user objects.  Feishu/Lark has also been
+    # observed to surface button data under ``form_value`` in callback payloads.
+    for attr in ("value", "form_value", "data"):
+        try:
+            nested = getattr(raw_value, attr)
+        except Exception:
+            nested = None
+        if nested is not None and nested is not raw_value:
+            coerced = _coerce_card_action_value(nested)
+            if coerced:
+                return coerced
+    return {}
+
+
+def _card_action_field(action: Any, name: str) -> Any:
+    """Read a field from either SDK model objects or raw callback dicts."""
+    if action is None:
+        return None
+    if isinstance(action, dict):
+        return action.get(name)
+    try:
+        return getattr(action, name)
+    except Exception:
+        return None
+
+
+def _extract_card_action_value(action: Any) -> Dict[str, Any]:
+    """Extract Hermes button metadata from a Feishu card action.
+
+    The canonical location is ``action.value``.  In webhook mode / older SDK
+    versions the value can be missing or moved to ``form_value``; for new cards
+    we also set ``action.name`` to the action key so the clicked button can be
+    identified even when Feishu drops the custom value object.
+    """
+    action_value = _coerce_card_action_value(_card_action_field(action, "value"))
+    if not action_value:
+        action_value = _coerce_card_action_value(_card_action_field(action, "form_value"))
+
+    action_name = str(_card_action_field(action, "name") or "").strip()
+    if action_name:
+        if action_name in _APPROVAL_CHOICE_MAP and "hermes_action" not in action_value:
+            action_value = {**action_value, "hermes_action": action_name}
+        elif action_name in {"y", "n"} and "hermes_update_prompt_action" not in action_value:
+            action_value = {**action_value, "hermes_update_prompt_action": action_name}
+    return action_value
+
+
+def _summarize_card_action_for_log(action: Any) -> Dict[str, str]:
+    """Return a compact, redacted action-field snapshot for callback debugging."""
+    from agent.redact import redact_sensitive_text
+
+    summary: Dict[str, str] = {"type": type(action).__name__ if action is not None else "None"}
+    if action is None:
+        return summary
+    for field in ("tag", "name", "option", "value", "form_value", "input_value", "options", "checked"):
+        raw = _card_action_field(action, field)
+        if raw is None:
+            continue
+        text = redact_sensitive_text(repr(raw))
+        if len(text) > 240:
+            text = f"{text[:240]}..."
+        summary[field] = f"{type(raw).__name__}:{text}"
+    return summary
+
+
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
@@ -1905,7 +2016,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": label},
                     "type": btn_type,
-                    "value": {"hermes_action": action_name, "approval_id": approval_id},
+                    # ``name`` is echoed by Feishu even in callback modes that
+                    # drop custom ``value``; keep both so old and new clients
+                    # can identify the selected button.
+                    "name": action_name,
+                    "value": {"hermes_action": action_name, "approval_id": str(approval_id)},
                 }
 
             card = {
@@ -1961,9 +2076,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": label},
                 "type": btn_type,
+                "name": answer,
                 "value": {
                     "hermes_update_prompt_action": answer,
-                    "update_prompt_id": prompt_id,
+                    "update_prompt_id": str(prompt_id),
                 },
             }
 
@@ -2553,12 +2669,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
-        action_value = getattr(action, "value", {}) or {}
-        hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
-        update_prompt_action = (
-            action_value.get("hermes_update_prompt_action")
-            if isinstance(action_value, dict) else None
-        )
+        action_value = _extract_card_action_value(action)
+        hermes_action = action_value.get("hermes_action")
+        update_prompt_action = action_value.get("hermes_update_prompt_action")
 
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
@@ -2569,6 +2682,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 loop=loop,
             )
 
+        logger.warning(
+            "[Feishu] Card action missing Hermes metadata; falling back to synthetic /card. action=%s",
+            _summarize_card_action_for_log(action),
+        )
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         if P2CardActionTriggerResponse is None:
             return None
@@ -2603,13 +2720,43 @@ class FeishuAdapter(BasePlatformAdapter):
             return True
         return "*" in allowed_ids or normalized in allowed_ids
 
+    def _infer_pending_approval_id_for_event(self, event: Any) -> Optional[Any]:
+        """Infer approval id when Feishu preserves button name but drops value.
+
+        This is deliberately conservative: only infer when there is exactly one
+        pending approval for the callback chat.  If multiple approvals are open,
+        requiring the explicit id is safer than guessing the wrong command.
+        """
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        if not callback_chat_id:
+            return None
+        matches = [
+            approval_id
+            for approval_id, state in self._approval_state.items()
+            if str(state.get("chat_id", "") or "") == callback_chat_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning(
+                "[Feishu] Card action missing approval_id and %d approvals are pending in chat %s; not guessing",
+                len(matches),
+                callback_chat_id,
+            )
+        return None
+
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
         approval_id = action_value.get("approval_id")
         if approval_id is None:
+            approval_id = self._infer_pending_approval_id_for_event(event)
+        if approval_id is None:
             logger.debug("[Feishu] Card action missing approval_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         state = self._approval_state.get(approval_id)
+        if not state and isinstance(approval_id, str) and approval_id.isdigit():
+            approval_id = int(approval_id)
+            state = self._approval_state.get(approval_id)
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
@@ -2617,8 +2764,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        if not self._is_interactive_operator_authorized(open_id):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2665,7 +2811,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if prompt_id is None:
             logger.debug("[Feishu] Card action missing update_prompt_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
-        state = self._update_prompt_state.get(prompt_id)
+        if isinstance(prompt_id, str) and prompt_id.isdigit():
+            prompt_id = int(prompt_id)
+        prompt_key = prompt_id if isinstance(prompt_id, int) else None
+        state = self._update_prompt_state.get(prompt_key) if prompt_key is not None else None
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
@@ -2884,8 +3033,8 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         action = getattr(event, "action", None)
-        action_tag = str(getattr(action, "tag", "") or "button")
-        action_value = getattr(action, "value", {}) or {}
+        action_tag = str(_card_action_field(action, "tag") or "button")
+        action_value = _extract_card_action_value(action)
 
         synthetic_text = f"/card {action_tag}"
         if action_value:
