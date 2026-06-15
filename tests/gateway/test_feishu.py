@@ -417,6 +417,45 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_runtime_footer_card_ignores_markdown_report_tail_with_agent_names(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        report = (
+            "## （1）Promote now\n\n"
+            "- **`cron-contract-coverage-audit`｜來源：`audit-agent`｜為何重要：** 補足 cron 檢查。\n\n"
+            "- **`multi-user-mutation-governance`｜來源：`audit-agent`｜為何重要：** 治理核心。\n"
+            "- **`department-agent-runtime-enforcement`｜來源：`audit-agent`｜為何重要：** runtime guard。"
+        )
+
+        msg_type, payload = adapter._build_outbound_payload(report)
+
+        self.assertEqual(msg_type, "post")
+        self.assertIn("multi-user-mutation-governance", payload)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_runtime_footer_card_still_accepts_profile_plus_telemetry_footer(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        msg_type, payload = adapter._build_outbound_payload(
+            "完成\n\n"
+            "purchase-agent\n"
+            "gpt-5.5 | openai-codex | thinking\n"
+            "ctx:123/400K (31%) | c:0 | S:96% left | W:91% left"
+        )
+
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["header"]["title"]["content"], "Hermes · purchase-agent")
+        self.assertEqual(card["elements"][0]["content"], "完成")
+        note = card["elements"][1]["elements"][0]["content"]
+        self.assertIn("gpt-5.5 | openai-codex | thinking", note)
+        self.assertIn("ctx:123/400K", note)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_get_chat_info_uses_real_feishu_chat_api(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
