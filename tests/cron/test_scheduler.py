@@ -522,7 +522,7 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
+        assert "Cronjob Response: Hermes · default — daily-report" in sent_content
         assert "(job_id: test-job)" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
@@ -547,7 +547,29 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert "Cronjob Response: Hermes · default — abc-123" in sent_content
+
+    def test_delivery_header_uses_job_profile(self):
+        """Cron wrapper header should expose the job's owning Hermes profile."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.FEISHU: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "purchase-sync",
+                "name": "Purchase report SharePoint daily sync",
+                "profile": "purchase-agent",
+                "deliver": "feishu:oc_test",
+            }
+            _deliver_result(job, "Output.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "Cronjob Response: Hermes · purchase-agent — Purchase report SharePoint daily sync" in sent_content
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""

@@ -710,6 +710,15 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _cron_delivery_header_title(job: dict, task_name: str) -> str:
+    """Return the user-visible cron header with the owning Hermes agent/profile."""
+    profile = str(job.get("profile") or "default").strip() or "default"
+    title = str(task_name or job.get("id") or "").strip() or profile
+    if title.startswith("Hermes ·"):
+        return title
+    return f"Hermes · {profile} — {title}"
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -745,8 +754,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
+        header_title = _cron_delivery_header_title(job, task_name)
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
+            f"Cronjob Response: {header_title}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
