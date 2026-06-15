@@ -293,6 +293,7 @@ def _resolve_oneshot_rate_limit_budget(agent: Any) -> str | None:
 def _build_oneshot_metadata(*, agent: Any, model: str, provider: str | None) -> dict[str, Any]:
     context_tokens, context_length, compression_count = _resolve_oneshot_context_snapshot(agent)
     payload: dict[str, Any] = {
+        "session_id": str(getattr(agent, "session_id", "") or "").strip() or None,
         "model": str(model or "").strip() or None,
         "provider": str(provider or "").strip() or None,
         "reasoning": _resolve_oneshot_reasoning(agent),

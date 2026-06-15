@@ -746,6 +746,7 @@ def test_build_oneshot_metadata_captures_ctx_reasoning_and_budget():
     )
     rl_state = types.SimpleNamespace(has_data=True)
     agent = types.SimpleNamespace(
+        session_id="session-123",
         context_compressor=compressor,
         reasoning_config={"enabled": True, "effort": "high"},
         get_rate_limit_state=lambda: rl_state,
@@ -761,6 +762,7 @@ def test_build_oneshot_metadata_captures_ctx_reasoning_and_budget():
         rlt.format_rate_limit_compact = original
 
     assert payload == {
+        "session_id": "session-123",
         "model": "gpt-test",
         "provider": "demo",
         "reasoning": "high",
