@@ -4557,27 +4557,69 @@ class FeishuAdapter(BasePlatformAdapter):
         return text.strip()
 
     @staticmethod
+    def _looks_like_runtime_footer_identity_line(line: str) -> bool:
+        """Return True for compact profile/identity footer lines.
+
+        Identity-only lines are intentionally *not* sufficient to classify a
+        block as runtime footer; they only help once telemetry is also present.
+        This prevents normal report sections mentioning profile names such as
+        ``audit-agent`` from being swallowed into the Feishu card header/footer.
+        """
+        text = str(line or "").strip()
+        if not text:
+            return False
+        if text == "default":
+            return True
+        return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,64}-agent", text))
+
+    @staticmethod
+    def _looks_like_runtime_footer_telemetry_line(line: str) -> bool:
+        text = str(line or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if any(token in lowered for token in ("ctx:", "openai", "openrouter", "anthropic", "codex", "gpt-", "claude", "gemini")):
+            return True
+        return bool(re.search(r"(?:^|\s)[csw]:\s*\d", lowered))
+
+    @staticmethod
+    def _looks_like_runtime_footer_markup_line(line: str) -> bool:
+        stripped = str(line or "").lstrip()
+        return bool(re.match(r"(?:#{1,6}\s|[-*]\s|\d+[.)]\s|>\s|\||```)", stripped))
+
+    @staticmethod
     def _looks_like_runtime_footer_block(footer: str) -> bool:
         probe = str(footer or "").strip()
         if not probe:
             return False
-        lowered = probe.lower()
-        hints = (
-            "ctx:",
-            "openai",
-            "openrouter",
-            "anthropic",
-            "codex",
-            "gpt-",
-            "claude",
-            "gemini",
-            "default",
-            "-agent",
-            "c:",
-            "s:",
-            "w:",
+
+        footer_lines = [line.strip() for line in probe.splitlines() if line.strip()]
+        if not footer_lines:
+            return False
+
+        # Runtime metadata is intentionally compact.  A long multi-line block is
+        # almost certainly report/body content separated by a blank line (for
+        # example a cron section full of bullets mentioning ``*-agent`` profiles),
+        # not a footer.
+        if len(footer_lines) > 6 or len(probe) > 900:
+            return False
+        if any(FeishuAdapter._looks_like_runtime_footer_markup_line(line) for line in footer_lines):
+            return False
+
+        telemetry_present = any(
+            FeishuAdapter._looks_like_runtime_footer_telemetry_line(line)
+            for line in footer_lines
         )
-        return any(token in lowered for token in hints)
+        if not telemetry_present:
+            # A bare profile name alone is too ambiguous to upgrade into a card;
+            # require provider/model/ctx/budget telemetry elsewhere in the footer.
+            return False
+
+        return all(
+            FeishuAdapter._looks_like_runtime_footer_telemetry_line(line)
+            or FeishuAdapter._looks_like_runtime_footer_identity_line(line)
+            for line in footer_lines
+        )
 
     def _build_runtime_footer_card_payload(self, content: str) -> Optional[dict[str, Any]]:
         text = str(content or "").strip()
@@ -5366,15 +5408,30 @@ def _probe_bot_http(app_id: str, app_secret: str, domain: str) -> Optional[dict]
     base_url = _onboard_open_base_url(domain)
     try:
         token_data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
-        token_req = Request(
-            f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
-            data=token_data,
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(token_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            token_res = json.loads(resp.read().decode("utf-8"))
+        access_token = None
+        for attempt in range(1, 4):
+            token_req = Request(
+                f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+                data=token_data,
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urlopen(token_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
+                    token_res = json.loads(resp.read().decode("utf-8"))
+            except (URLError, OSError, json.JSONDecodeError):
+                if attempt == 3:
+                    raise
+                time.sleep(0.75 * attempt)
+                continue
 
-        access_token = token_res.get("tenant_access_token")
+            access_token = token_res.get("tenant_access_token")
+            if access_token:
+                break
+            code = token_res.get("code")
+            if str(code) == "2200" and attempt < 3:
+                time.sleep(0.75 * attempt)
+                continue
+            return None
         if not access_token:
             return None
 
