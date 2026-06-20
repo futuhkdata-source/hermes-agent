@@ -109,6 +109,21 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_profile_relative_path_uses_profile_scripts_dir(self, cron_env):
+        """Named-profile cron scripts resolve under that profile's scripts dir."""
+        from cron.scheduler import _run_job_script
+
+        root_script = cron_env / "scripts" / "shared_name.py"
+        root_script.write_text('print("root script")\n')
+        profile_scripts = cron_env / "profiles" / "purchase-agent" / "scripts"
+        profile_scripts.mkdir(parents=True)
+        profile_script = profile_scripts / "shared_name.py"
+        profile_script.write_text('print("profile script")\n')
+
+        success, output = _run_job_script("shared_name.py", profile="purchase-agent")
+        assert success is True
+        assert output == "profile script"
+
     def test_script_not_found(self, cron_env):
         from cron.scheduler import _run_job_script
 
@@ -196,6 +211,31 @@ class TestRunJobScript:
         assert success is True
         parsed = json.loads(output)
         assert parsed["new_prs"][0]["number"] == 42
+
+
+class TestRunJobNoAgentProfileScript:
+    """Regression tests for no_agent jobs owned by named profiles."""
+
+    def test_no_agent_job_uses_profile_scripts_dir(self, cron_env):
+        from cron.scheduler import run_job
+
+        profile_scripts = cron_env / "profiles" / "tender-intel-collector-agent" / "scripts"
+        profile_scripts.mkdir(parents=True)
+        script = profile_scripts / "cron-profile-only.py"
+        script.write_text('print("profile-only no-agent output")\n')
+
+        job = {
+            "id": "profile-no-agent",
+            "name": "profile no-agent",
+            "profile": "tender-intel-collector-agent",
+            "script": "cron-profile-only.py",
+            "no_agent": True,
+        }
+
+        ok, _doc, final_response, error = run_job(job)
+        assert ok is True
+        assert error is None
+        assert final_response == "profile-only no-agent output"
 
 
 class TestBuildJobPromptWithScript:

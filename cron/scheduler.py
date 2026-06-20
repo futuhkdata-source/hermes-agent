@@ -967,11 +967,46 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _resolve_job_scripts_dir(profile: str | None = None) -> tuple[Path | None, str | None]:
+    """Return the trusted scripts directory for a cron job profile.
+
+    Default-profile jobs use ``$HERMES_HOME/scripts``.  Named profile jobs use
+    ``$HERMES_HOME/profiles/<profile>/scripts`` without mutating process-wide
+    ``HERMES_HOME``.  The profile value is treated as a single path segment so
+    a poisoned jobs.json cannot use profile traversal to widen script access.
+    """
+    hermes_home = _get_hermes_home()
+    profile_name = str(profile or "").strip()
+    if not profile_name or profile_name == "default":
+        return hermes_home / "scripts", None
+
+    if (
+        profile_name in {".", ".."}
+        or "/" in profile_name
+        or "\\" in profile_name
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", profile_name)
+    ):
+        return None, f"Invalid profile name for cron script resolution: {profile_name!r}"
+
+    profiles_dir = (hermes_home / "profiles").resolve()
+    scripts_dir = hermes_home / "profiles" / profile_name / "scripts"
+    try:
+        scripts_dir.resolve().relative_to(profiles_dir)
+    except ValueError:
+        return None, (
+            f"Blocked: profile scripts directory resolves outside the profiles "
+            f"directory ({profiles_dir}): {profile_name!r}"
+        )
+    return scripts_dir, None
+
+
+def _run_job_script(script_path: str, profile: str | None = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
-    Scripts must reside within HERMES_HOME/scripts/.  Both relative and
-    absolute paths are resolved and validated against this directory to
+    Scripts must reside within the trusted scripts directory for the owning
+    profile.  Default-profile jobs use ``HERMES_HOME/scripts/``; named profile
+    jobs use ``HERMES_HOME/profiles/<profile>/scripts/``.  Both relative and
+    absolute paths are resolved and validated against that directory to
     prevent arbitrary script execution via path traversal or absolute
     path injection.
 
@@ -991,15 +1026,22 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
-            against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
-            are also validated to ensure they stay within the scripts dir.
+            against the owning profile's trusted scripts directory.  Absolute
+            and ~-prefixed paths are also validated to ensure they stay within
+            that scripts dir.
+        profile: Optional cron job profile name. ``None`` and ``default`` use
+            ``HERMES_HOME/scripts``; named profiles use
+            ``HERMES_HOME/profiles/<profile>/scripts``.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir, scripts_dir_error = _resolve_job_scripts_dir(profile)
+    if scripts_dir_error or scripts_dir is None:
+        return False, scripts_dir_error or "Invalid cron script directory"
+    if not profile or str(profile).strip() == "default":
+        scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
     raw = Path(script_path).expanduser()
@@ -1142,7 +1184,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, profile=job.get("profile"))
         if success:
             if script_output:
                 prompt = (
@@ -1436,7 +1478,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, profile=job.get("profile"))
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1525,7 +1567,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, profile=job.get("profile"))
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
