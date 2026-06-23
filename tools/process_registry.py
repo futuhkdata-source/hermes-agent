@@ -524,6 +524,15 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        watcher_platform: str = "",
+        watcher_chat_id: str = "",
+        watcher_user_id: str = "",
+        watcher_user_name: str = "",
+        watcher_thread_id: str = "",
+        watcher_message_id: str = "",
+        watcher_interval: int = 0,
+        notify_on_complete: bool = False,
+        watch_patterns: Optional[List[str]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -542,6 +551,15 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            watcher_platform=watcher_platform,
+            watcher_chat_id=watcher_chat_id,
+            watcher_user_id=watcher_user_id,
+            watcher_user_name=watcher_user_name,
+            watcher_thread_id=watcher_thread_id,
+            watcher_message_id=watcher_message_id,
+            watcher_interval=watcher_interval,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=list(watch_patterns or []),
         )
 
         if use_pty:
@@ -572,13 +590,13 @@ class ProcessRegistry:
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
-                reader.start()
 
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                reader.start()
                 return session
 
             except ImportError:
@@ -615,7 +633,6 @@ class ProcessRegistry:
         session.pid = proc.pid
 
         try:
-            # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(session,),
@@ -623,18 +640,30 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
+            # Register the session before the reader can observe EOF. Fast
+            # commands can exit before Thread.start() returns; if the reader
+            # moved such a session to finished before it had ever been present
+            # in _running, notify_on_complete was skipped. Persist before the
+            # reader starts so a fast exit cannot be followed by a stale
+            # running checkpoint write from this spawn path.
             self._write_checkpoint()
+            reader.start()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
             try:
+                with self._lock:
+                    self._running.pop(session.id, None)
+                try:
+                    self._write_checkpoint()
+                except Exception:
+                    pass
                 if not _IS_WINDOWS:
                     try:
                         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -661,6 +690,15 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        watcher_platform: str = "",
+        watcher_chat_id: str = "",
+        watcher_user_id: str = "",
+        watcher_user_name: str = "",
+        watcher_thread_id: str = "",
+        watcher_message_id: str = "",
+        watcher_interval: int = 0,
+        notify_on_complete: bool = False,
+        watch_patterns: Optional[List[str]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -682,6 +720,15 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            watcher_platform=watcher_platform,
+            watcher_chat_id=watcher_chat_id,
+            watcher_user_id=watcher_user_id,
+            watcher_user_name=watcher_user_name,
+            watcher_thread_id=watcher_thread_id,
+            watcher_message_id=watcher_message_id,
+            watcher_interval=watcher_interval,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=list(watch_patterns or []),
         )
 
         # Run the command in the sandbox with output capture
@@ -732,8 +779,15 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
+        with self._lock:
+            self._prune_if_needed()
+            if not session.exited:
+                self._running[session.id] = session
+
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
+            # Same ordering invariant as spawn_local: make the session visible
+            # and checkpointed before the poller can notice the child has
+            # already exited.
             reader = threading.Thread(
                 target=self._env_poller_loop,
                 args=(session, env, log_path, pid_path, exit_path),
@@ -741,15 +795,8 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
-
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
             self._write_checkpoint()
+            reader.start()
 
         return session
 

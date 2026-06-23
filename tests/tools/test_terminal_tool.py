@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -200,6 +202,22 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_background_terminal_is_blocked_in_department_routed_oneshot(monkeypatch):
+    monkeypatch.setenv("HERMES_ROUTED_REQUEST", "1")
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "true",
+            background=True,
+            notify_on_complete=True,
+        )
+    )
+
+    assert result["exit_code"] == -1
+    assert "department-routed one-shot" in result["error"]
+    assert "cannot proactively report" in result["error"]
 
 
 def test_get_env_config_ignores_bad_docker_json_for_local_backend(monkeypatch):

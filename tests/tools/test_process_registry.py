@@ -537,6 +537,98 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
+    def test_spawn_local_registers_before_reader_start_for_fast_notify(self, registry):
+        """A fast process must still enqueue notify_on_complete."""
+
+        class EmptyStdout:
+            def read(self, _size):
+                return ""
+
+        proc = MagicMock()
+        proc.pid = 4321
+        proc.stdout = EmptyStdout()
+        proc.stdin = MagicMock()
+        proc.returncode = 0
+        proc.wait = MagicMock(return_value=0)
+
+        class ImmediateReaderThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                assert self.target is not None
+                self.target(*self.args)
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", return_value=proc), \
+            patch("threading.Thread", side_effect=ImmediateReaderThread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local(
+                "true",
+                cwd="/tmp",
+                notify_on_complete=True,
+            )
+
+        assert session.id in registry._finished
+        assert session.id not in registry._running
+        evt = registry.completion_queue.get_nowait()
+        assert evt["type"] == "completion"
+        assert evt["session_id"] == session.id
+        assert evt["exit_code"] == 0
+
+    def test_spawn_local_checkpoint_includes_initial_notification_metadata(self, registry, tmp_path):
+        """Notification metadata is persisted before any restart can recover it."""
+        checkpoint = tmp_path / "procs.json"
+        proc = MagicMock()
+        proc.pid = 9876
+        proc.stdout = iter([])
+        proc.stdin = MagicMock()
+        proc.poll.return_value = None
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", return_value=proc), \
+            patch("threading.Thread", return_value=fake_thread):
+            session = registry.spawn_local(
+                "sleep 60",
+                cwd="/tmp",
+                session_key="agent:main:feishu:dm:oc_123",
+                watcher_platform="feishu",
+                watcher_chat_id="oc_123",
+                watcher_user_id="u1",
+                watcher_user_name="Harrison",
+                watcher_thread_id="th1",
+                watcher_message_id="om_1",
+                watcher_interval=5,
+                notify_on_complete=True,
+                watch_patterns=["READY"],
+            )
+
+        data = json.loads(checkpoint.read_text())
+        assert data == [
+            {
+                "session_id": session.id,
+                "command": "sleep 60",
+                "pid": 9876,
+                "pid_scope": "host",
+                "cwd": "/tmp",
+                "started_at": session.started_at,
+                "task_id": "",
+                "session_key": "agent:main:feishu:dm:oc_123",
+                "watcher_platform": "feishu",
+                "watcher_chat_id": "oc_123",
+                "watcher_user_id": "u1",
+                "watcher_user_name": "Harrison",
+                "watcher_thread_id": "th1",
+                "watcher_message_id": "om_1",
+                "watcher_interval": 5,
+                "notify_on_complete": True,
+                "watch_patterns": ["READY"],
+            }
+        ]
+
     def test_spawn_via_env_uses_backend_temp_dir_for_artifacts(self, registry):
         class FakeEnv:
             def __init__(self):

@@ -2157,6 +2157,48 @@ def terminal_tool(
                 env=env,
                 default_cwd=cwd,
             )
+
+            if os.getenv("HERMES_ROUTED_REQUEST") == "1" or os.getenv("HERMES_DEPARTMENT_ROUTED") == "1":
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "background=true is disabled inside department-routed one-shot "
+                        "profile runs. The routed subprocess exits after its reply, so "
+                        "terminal(background=True, notify_on_complete=True) cannot "
+                        "proactively report completion. Run the work in foreground, "
+                        "or create a real durable return path (cron/no-agent watcher, "
+                        "Kanban task, or another long-lived gateway-owned mechanism)."
+                    ),
+                }, ensure_ascii=False)
+
+            # Resolve notification semantics before the child is started.  Fast
+            # background commands can exit before terminal_tool returns; setting
+            # notify/watch metadata only after spawn creates a race where the
+            # completion is missed even though the tool result says
+            # notify_on_complete=True.
+            watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+                notify_on_complete=bool(notify_on_complete),
+                watch_patterns=watch_patterns,
+                background=bool(background),
+            )
+            _watch_patterns = list(watch_patterns or [])
+            _gw_platform = ""
+            _gw_chat_id = ""
+            _gw_thread_id = ""
+            _gw_user_id = ""
+            _gw_user_name = ""
+            _gw_message_id = ""
+            if background and (notify_on_complete or _watch_patterns):
+                from gateway.session_context import get_session_env as _gse
+                _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                if _gw_platform:
+                    _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+                    _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
+                    _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
+                    _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
+                    _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
+            _watcher_interval = 5 if (notify_on_complete and _gw_platform) else 0
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2166,6 +2208,15 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        watcher_platform=_gw_platform,
+                        watcher_chat_id=_gw_chat_id,
+                        watcher_user_id=_gw_user_id,
+                        watcher_user_name=_gw_user_name,
+                        watcher_thread_id=_gw_thread_id,
+                        watcher_message_id=_gw_message_id,
+                        watcher_interval=_watcher_interval,
+                        notify_on_complete=bool(notify_on_complete),
+                        watch_patterns=_watch_patterns,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2174,6 +2225,15 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        watcher_platform=_gw_platform,
+                        watcher_chat_id=_gw_chat_id,
+                        watcher_user_id=_gw_user_id,
+                        watcher_user_name=_gw_user_name,
+                        watcher_thread_id=_gw_thread_id,
+                        watcher_message_id=_gw_message_id,
+                        watcher_interval=_watcher_interval,
+                        notify_on_complete=bool(notify_on_complete),
+                        watch_patterns=_watch_patterns,
                     )
 
                 result_data = {
@@ -2293,54 +2353,20 @@ def terminal_tool(
                             else canonical_hint
                         )
 
-                # Populate routing metadata on the session so that
-                # watch-pattern and completion notifications can be
-                # routed back to the correct chat/thread.
-                if background and (notify_on_complete or watch_patterns):
-                    from gateway.session_context import get_session_env as _gse
-                    _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                    if _gw_platform:
-                        _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
-                        _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
-                        _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
-                        _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
-                        _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
-                        proc_session.watcher_platform = _gw_platform
-                        proc_session.watcher_chat_id = _gw_chat_id
-                        proc_session.watcher_user_id = _gw_user_id
-                        proc_session.watcher_user_name = _gw_user_name
-                        proc_session.watcher_thread_id = _gw_thread_id
-                        proc_session.watcher_message_id = _gw_message_id
-
-                # Mutual exclusion: if both notify_on_complete and watch_patterns
-                # are set, drop watch_patterns. The combination produces duplicate
-                # notifications (one per match + one on exit) that deliver
-                # asynchronously and can spam the user long after the process ends.
-                # notify_on_complete is the more useful signal for "let me know
-                # when the task finishes"; watch_patterns should be reserved for
-                # standalone mid-process signals on long-lived processes.
-                watch_patterns, conflict_note = _resolve_notification_flag_conflict(
-                    notify_on_complete=bool(notify_on_complete),
-                    watch_patterns=watch_patterns,
-                    background=bool(background),
-                )
                 if conflict_note:
                     logger.warning("background proc %s: %s", proc_session.id, conflict_note)
                     result_data["watch_patterns_ignored"] = conflict_note
 
-                # Mark for agent notification on completion
                 if notify_on_complete and background:
-                    proc_session.notify_on_complete = True
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent
                     # turn.  CLI mode uses the completion_queue directly.
                     if proc_session.watcher_platform:
-                        proc_session.watcher_interval = 5
                         process_registry.pending_watchers.append({
                             "session_id": proc_session.id,
-                            "check_interval": 5,
+                            "check_interval": proc_session.watcher_interval or 5,
                             "session_key": session_key,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
@@ -2351,10 +2377,8 @@ def terminal_tool(
                             "notify_on_complete": True,
                         })
 
-                # Set watch patterns for output monitoring
-                if watch_patterns and background:
-                    proc_session.watch_patterns = list(watch_patterns)
-                    result_data["watch_patterns"] = proc_session.watch_patterns
+                if _watch_patterns and background:
+                    result_data["watch_patterns"] = _watch_patterns
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
