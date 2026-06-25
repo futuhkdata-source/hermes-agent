@@ -2051,17 +2051,26 @@ def _teams_pipeline_plugin_enabled() -> bool:
 
 
 def _load_gateway_config() -> dict:
-    """Load and parse ~/.hermes/config.yaml, returning {} on any error.
+    """Load and parse the active Hermes home's config.yaml, returning {} on error.
 
-    Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
-    still see their fixture) and shares the mtime-keyed raw-yaml cache
-    from ``hermes_cli.config.read_raw_config`` when the paths match.
+    Normally this uses the module-level ``_hermes_home`` so tests that
+    monkeypatch it still see their fixture.  When a profile runtime scope is
+    active, prefer that context-local Hermes home so routed profile turns read
+    the routed profile's config instead of the default gateway profile.
 
     Managed scope is overlaid on the result (via the shared helper) so the
     gateway honors administrator-pinned values — neither read_raw_config nor a
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
-    config_path = _hermes_home / 'config.yaml'
+    config_home = _hermes_home
+    try:
+        from hermes_constants import get_hermes_home_override
+        scoped_home = get_hermes_home_override()
+        if scoped_home:
+            config_home = Path(scoped_home)
+    except Exception:
+        pass
+    config_path = config_home / 'config.yaml'
     raw: dict = {}
     used_canonical = False
     try:
@@ -2431,6 +2440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    supports_pre_gateway_route_profile: bool = True
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3003,18 +3013,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         config = getattr(self, "config", None)
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
-        # produces the same namespace as the primary path: None (legacy
-        # agent:main) unless multiplexing is on, then the active profile.
-        _profile = None
-        if getattr(config, "multiplex_profiles", False):
-            if source.profile:
-                _profile = source.profile
-            else:
-                try:
-                    from hermes_cli.profiles import get_active_profile_name
-                    _profile = get_active_profile_name() or "default"
-                except Exception:
-                    _profile = None
+        # produces the same namespace as the primary path: explicit
+        # source.profile always wins; otherwise None (legacy agent:main) unless
+        # multiplexing is on, then the active profile.
+        _profile = (source.profile or "").strip() or None
+        if _profile is None and getattr(config, "multiplex_profiles", False):
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile = get_active_profile_name() or "default"
+            except Exception:
+                _profile = None
         return build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
@@ -7193,6 +7201,151 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _normalize_pre_gateway_route_profile(self, raw_profile: Any) -> Optional[str]:
+        """Return a canonical named profile for pre-dispatch routing, or None.
+
+        The route action is an auth-bypassing gateway primitive, so core only
+        accepts syntactically-valid *named* profiles here. ``default``/``main``
+        are intentionally rejected: routing to the legacy namespace is not a
+        department handoff and must not be allowed to smuggle ``skip_auth`` into
+        the normal default-profile path.
+        """
+        try:
+            if not isinstance(raw_profile, str) or not raw_profile.strip():
+                return None
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+            profile = normalize_profile_name(raw_profile)
+            validate_profile_name(profile)
+        except Exception:
+            return None
+        if profile in {"default", "main"}:
+            return None
+        return profile
+
+    def _apply_pre_gateway_dispatch_hook(
+        self,
+        event: MessageEvent,
+        *,
+        is_internal: Optional[bool] = None,
+    ) -> tuple[MessageEvent, SessionSource, bool, bool]:
+        """Apply the pre_gateway_dispatch hook once for an inbound event.
+
+        Returns ``(event, source, skip, authorized)``.  Platform adapters call
+        this before computing their active-session key so a native route action
+        can stamp ``source.profile`` early enough for busy-session guards,
+        queued follow-ups, approvals, and post-delivery callbacks.  The runner
+        calls the same helper for direct tests / non-adapter paths; an event
+        marker prevents duplicate plugin side effects.
+        """
+        source = event.source
+        if is_internal is None:
+            is_internal = bool(getattr(event, "internal", False))
+        if is_internal:
+            return event, source, False, False
+
+        state = getattr(event, "_hermes_pre_gateway_dispatch_state", None)
+        if isinstance(state, dict) and state.get("applied"):
+            return event, event.source, bool(state.get("skip")), bool(state.get("authorized"))
+
+        skip_dispatch = False
+        pre_gateway_dispatch_authorized = False
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _hook_results = _invoke_hook(
+                "pre_gateway_dispatch",
+                event=event,
+                gateway=self,
+                session_store=self.session_store,
+            )
+        except Exception as _hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+            _hook_results = []
+
+        for _result in _hook_results:
+            if not isinstance(_result, dict):
+                continue
+            _action = str(_result.get("action") or "").strip().lower()
+
+            if _action in {"route", "route_profile"}:
+                route_profile = self._normalize_pre_gateway_route_profile(
+                    _result.get("profile") or _result.get("route_profile")
+                )
+                if not route_profile:
+                    logger.warning(
+                        "Ignoring invalid pre_gateway_dispatch route profile: %r",
+                        _result.get("profile") or _result.get("route_profile"),
+                    )
+                    continue
+                if source is not None:
+                    source = dataclasses.replace(
+                        source,
+                        profile=route_profile,
+                        session_anchor_id=(
+                            _result.get("session_anchor_id")
+                            if "session_anchor_id" in _result
+                            else source.session_anchor_id
+                        ),
+                        thread_id=(
+                            _result.get("thread_id")
+                            if "thread_id" in _result
+                            else source.thread_id
+                        ),
+                    )
+                    event = dataclasses.replace(event, source=source)
+                route_prompt = _result.get("channel_prompt")
+                if isinstance(route_prompt, str) and route_prompt.strip():
+                    existing_prompt = event.channel_prompt or ""
+                    merged_prompt = (
+                        f"{existing_prompt}\n\n{route_prompt.strip()}"
+                        if existing_prompt.strip()
+                        else route_prompt.strip()
+                    )
+                    event = dataclasses.replace(event, channel_prompt=merged_prompt)
+                pre_gateway_dispatch_authorized = bool(_result.get("skip_auth"))
+                source = event.source
+                logger.info(
+                    "pre_gateway_dispatch route: profile=%s reason=%s platform=%s chat=%s",
+                    route_profile,
+                    _result.get("reason"),
+                    source.platform.value if source and source.platform else "unknown",
+                    source.chat_id if source else "unknown",
+                )
+                break
+
+            if _action == "skip":
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    _result.get("reason"),
+                    source.platform.value if source and source.platform else "unknown",
+                    source.chat_id if source else "unknown",
+                )
+                skip_dispatch = True
+                break
+            if _action == "rewrite":
+                _new_text = _result.get("text")
+                if isinstance(_new_text, str):
+                    event = dataclasses.replace(event, text=_new_text)
+                source = event.source
+                break
+            if _action == "allow":
+                # The hook may have mutated/replaced event.source in-place.
+                source = event.source
+                break
+
+        try:
+            setattr(
+                event,
+                "_hermes_pre_gateway_dispatch_state",
+                {
+                    "applied": True,
+                    "skip": skip_dispatch,
+                    "authorized": pre_gateway_dispatch_authorized,
+                },
+            )
+        except Exception:
+            pass
+        return event, event.source, skip_dispatch, pre_gateway_dispatch_authorized
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -7221,47 +7374,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is_internal = bool(getattr(event, "internal", False))
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
-        # Plugins receive the MessageEvent and may return a dict influencing flow:
-        #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
-        #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
-                    "pre_gateway_dispatch",
-                    event=event,
-                    gateway=self,
-                    session_store=self.session_store,
-                )
-            except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
+        # Platform adapters may have already applied this before session-keying;
+        # the helper is idempotent and uses the event marker in that case.
+        event, source, pre_gateway_dispatch_skip, pre_gateway_dispatch_authorized = (
+            self._apply_pre_gateway_dispatch_hook(event, is_internal=is_internal)
+        )
+        if pre_gateway_dispatch_skip:
+            return None
 
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
-
-        if is_internal:
+        if is_internal or pre_gateway_dispatch_authorized:
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -14229,14 +14350,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
-        When multiplexing is active, resolve the inbound source's profile and
-        run the whole turn inside ``_profile_runtime_scope`` so config/skills/
-        memory resolve to that profile's home AND credentials resolve from that
-        profile's secret scope (never the process-global ``os.environ``). When
-        multiplexing is off this is a transparent pass-through — zero behavior
-        change for single-profile gateways.
+        When an inbound source carries an explicit profile route, or when
+        multiplexing is active, resolve the source's profile and run the whole
+        turn inside ``_profile_runtime_scope`` so config/skills/memory resolve
+        to that profile's home AND credentials resolve from that profile's
+        secret scope (never the process-global ``os.environ``). Without an
+        explicit profile and with multiplexing off this is a transparent
+        pass-through — zero behavior change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+        explicit_profile = bool((getattr(source, "profile", None) or "").strip())
+        if not explicit_profile and not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,

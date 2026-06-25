@@ -3990,10 +3990,31 @@ class BasePlatformAdapter(ABC):
         self._apply_topic_recovery(event)
         event = self._apply_group_reply_session_mode(event)
 
+        # Gateway-level pre-dispatch hooks (notably native profile routing)
+        # must run before this adapter computes its active-session key.  If the
+        # runner stamped source.profile only later, adapter guards would use
+        # agent:main while the runner used agent:<profile>, breaking busy
+        # queues, /stop, /approve, clarify replies, and post-delivery callbacks.
+        runner = getattr(self._message_handler, "__self__", None)
+        pre_dispatch = getattr(runner, "_apply_pre_gateway_dispatch_hook", None)
+        if callable(pre_dispatch):
+            try:
+                hook_result = pre_dispatch(
+                    event,
+                    is_internal=bool(getattr(event, "internal", False)),
+                )
+                if isinstance(hook_result, tuple) and len(hook_result) >= 4:
+                    event = hook_result[0]
+                    if bool(hook_result[2]):
+                        return
+            except Exception as e:
+                logger.warning("[%s] pre_gateway_dispatch early hook failed: %s", self.name, e)
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=(getattr(event.source, "profile", None) or None),
         )
 
         # On-entry self-heal: if the adapter still has an _active_sessions

@@ -821,16 +821,17 @@ class SessionStore:
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 
-        When ``multiplex_profiles`` is disabled (default), returns ``None`` so
-        keys stay in the legacy ``agent:main`` namespace — byte-identical to
-        before. When enabled, prefers the profile the inbound source was routed
-        to (``source.profile`` — set by the /p/<profile>/ URL prefix or
-        per-credential adapter), falling back to the active profile name.
+        An explicitly routed inbound source (``source.profile``) always owns its
+        profile namespace. When there is no explicit route and
+        ``multiplex_profiles`` is disabled (default), returns ``None`` so keys
+        stay in the legacy ``agent:main`` namespace — byte-identical to before.
+        When multiplexing is enabled without an explicit route, falls back to
+        the active profile name.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
-            return None
         if source is not None and source.profile:
             return source.profile
+        if not getattr(self.config, "multiplex_profiles", False):
+            return None
         try:
             from hermes_cli.profiles import get_active_profile_name
             return get_active_profile_name() or "default"

@@ -556,6 +556,7 @@ class TestCardActionCallbackResponse:
         adapter = _make_adapter()
         adapter._loop = MagicMock()
         adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_bob"}
         adapter._update_prompt_state[8] = {
             "session_key": "sess-up-8",
             "message_id": "msg_up_008",

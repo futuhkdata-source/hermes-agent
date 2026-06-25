@@ -116,7 +116,7 @@ old HTTP path needed). The relay-bus hop is inside the connector trust domain
 
 Source of truth: `SessionSource.to_dict()` in `gateway/session.py`. These are
 every key the gateway accepts on the wire. `platform`, `chat_id`, `chat_type`,
-`user_id`, `user_name`, `thread_id`, `chat_name`, and `chat_topic` are always
+`user_id`, `user_name`, `thread_id`, `session_anchor_id`, `chat_name`, and `chat_topic` are always
 present (may be `null`); the rest are included only when set.
 
 | Field | Type | Always sent | Meaning |
@@ -128,6 +128,7 @@ present (may be `null`); the rest are included only when set.
 | `user_id` | string\|null | yes | Message author id. Session-key discriminator. |
 | `user_name` | string\|null | yes | Author display name. |
 | `thread_id` | string\|null | yes | Thread/forum-topic id when in a thread. Session-key discriminator. |
+| `session_anchor_id` | string\|null | yes | Gateway-owned virtual lane anchor for message-anchored group sessions; when present it takes precedence over `thread_id` in session-keying. |
 | `chat_topic` | string\|null | yes | Channel topic/description (Discord, Slack). |
 | `user_id_alt` | string | no | Platform-specific stable alt id (Signal UUID, Feishu union_id). |
 | `chat_id_alt` | string | no | Alternate chat id (e.g. Signal group internal id). |
