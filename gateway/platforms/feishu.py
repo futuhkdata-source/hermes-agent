@@ -221,6 +221,9 @@ _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_always": "always",
     "deny": "deny",
 }
+_APPROVAL_ACTION_BY_CHOICE: Dict[str, str] = {
+    choice: action for action, choice in _APPROVAL_CHOICE_MAP.items()
+}
 _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "once": "Approved once",
     "session": "Approved for session",
@@ -1993,6 +1996,114 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    @staticmethod
+    def _approval_disabled_tips() -> Dict[str, str]:
+        return {
+            "tag": "plain_text",
+            "content": "This approval has already been clicked.",
+        }
+
+    @staticmethod
+    def _build_approval_button(
+        *,
+        label: str,
+        action_name: str,
+        approval_id: Any,
+        btn_type: str = "default",
+        selected_action: str = "",
+        disabled: bool = False,
+    ) -> Dict[str, Any]:
+        display_label = label
+        if selected_action == action_name:
+            display_label = f"{label} · Clicked"
+
+        button: Dict[str, Any] = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": display_label},
+            "type": btn_type,
+            # ``name`` is echoed by Feishu even in callback modes that drop
+            # custom ``value``; keep both so old and new clients can identify
+            # the selected button.
+            "name": action_name,
+            "value": {"hermes_action": action_name, "approval_id": str(approval_id)},
+        }
+        if disabled:
+            button["disabled"] = True
+            button["disabled_tips"] = FeishuAdapter._approval_disabled_tips()
+        return button
+
+    @staticmethod
+    def _build_approval_actions(
+        *,
+        approval_id: Any,
+        selected_action: str = "",
+        disabled: bool = False,
+    ) -> Dict[str, Any]:
+        return {
+            "tag": "action",
+            "actions": [
+                FeishuAdapter._build_approval_button(
+                    label="✅ Allow Once",
+                    action_name="approve_once",
+                    approval_id=approval_id,
+                    btn_type="primary",
+                    selected_action=selected_action,
+                    disabled=disabled,
+                ),
+                FeishuAdapter._build_approval_button(
+                    label="✅ Session",
+                    action_name="approve_session",
+                    approval_id=approval_id,
+                    selected_action=selected_action,
+                    disabled=disabled,
+                ),
+                FeishuAdapter._build_approval_button(
+                    label="✅ Always",
+                    action_name="approve_always",
+                    approval_id=approval_id,
+                    selected_action=selected_action,
+                    disabled=disabled,
+                ),
+                FeishuAdapter._build_approval_button(
+                    label="❌ Deny",
+                    action_name="deny",
+                    approval_id=approval_id,
+                    btn_type="danger",
+                    selected_action=selected_action,
+                    disabled=disabled,
+                ),
+            ],
+        }
+
+    @staticmethod
+    def _approval_card_config() -> Dict[str, Any]:
+        # ``update_multi`` makes Feishu/Lark treat approval prompts as shared
+        # cards, so the callback replacement (selected button disabled) is
+        # visible to everyone who received the card instead of only the clicker.
+        return {"wide_screen_mode": True, "update_multi": True}
+
+    @staticmethod
+    def _build_exec_approval_card(
+        *,
+        command_preview: str,
+        description: str,
+        approval_id: Any,
+    ) -> Dict[str, Any]:
+        return {
+            "config": FeishuAdapter._approval_card_config(),
+            "header": {
+                "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"```\n{command_preview}\n```\n**Reason:** {description}",
+                },
+                FeishuAdapter._build_approval_actions(approval_id=approval_id),
+            ],
+        }
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -2011,40 +2122,11 @@ class FeishuAdapter(BasePlatformAdapter):
             approval_id = next(self._approval_counter)
             cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
 
-            def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
-                return {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": btn_type,
-                    # ``name`` is echoed by Feishu even in callback modes that
-                    # drop custom ``value``; keep both so old and new clients
-                    # can identify the selected button.
-                    "name": action_name,
-                    "value": {"hermes_action": action_name, "approval_id": str(approval_id)},
-                }
-
-            card = {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
-                    "template": "orange",
-                },
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
-                    },
-                    {
-                        "tag": "action",
-                        "actions": [
-                            _btn("✅ Allow Once", "approve_once", "primary"),
-                            _btn("✅ Session", "approve_session"),
-                            _btn("✅ Always", "approve_always"),
-                            _btn("❌ Deny", "deny", "danger"),
-                        ],
-                    },
-                ],
-            }
+            card = self._build_exec_approval_card(
+                command_preview=cmd_preview,
+                description=description,
+                approval_id=approval_id,
+            )
 
             payload = json.dumps(card, ensure_ascii=False)
             response = await self._feishu_send_with_retry(
@@ -2061,6 +2143,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "command_preview": cmd_preview,
+                    "description": description,
                 }
             return result
         except Exception as exc:
@@ -2137,22 +2221,43 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     @staticmethod
-    def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
+    def _build_resolved_approval_card(
+        *,
+        choice: str,
+        user_name: str,
+        approval_id: Any = "",
+        command_preview: str = "",
+        description: str = "",
+    ) -> Dict[str, Any]:
         """Build raw card JSON for a resolved approval action."""
         icon = "❌" if choice == "deny" else "✅"
         label = _APPROVAL_LABEL_MAP.get(choice, "Resolved")
+        action_name = _APPROVAL_ACTION_BY_CHOICE.get(choice, "")
+        content = f"{icon} **{label}** by {user_name}"
+        if command_preview:
+            reason = f"\n**Reason:** {description}" if description else ""
+            content = f"```\n{command_preview}\n```{reason}\n\n{content}"
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": content,
+            },
+        ]
+        if approval_id:
+            elements.append(
+                FeishuAdapter._build_approval_actions(
+                    approval_id=approval_id,
+                    selected_action=action_name,
+                    disabled=True,
+                )
+            )
         return {
-            "config": {"wide_screen_mode": True},
+            "config": FeishuAdapter._approval_card_config(),
             "header": {
                 "title": {"content": f"{icon} {label}", "tag": "plain_text"},
                 "template": "red" if choice == "deny" else "green",
             },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"{icon} **{label}** by {user_name}",
-                },
-            ],
+            "elements": elements,
         }
 
     @staticmethod
@@ -2710,6 +2815,19 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
+    @staticmethod
+    def _build_card_callback_response(card_data: Dict[str, Any]) -> Any:
+        """Wrap raw card JSON in Feishu's synchronous card-action response."""
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = card_data
+            response.card = card
+        return response
+
     def _is_interactive_operator_authorized(self, open_id: str) -> bool:
         """Return whether this card-action operator may answer gated prompts."""
         normalized = str(open_id or "").strip()
@@ -2776,7 +2894,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
-        choice = _APPROVAL_CHOICE_MAP.get(action_value.get("hermes_action"), "deny")
+        action_name = str(action_value.get("hermes_action") or "")
+        choice = _APPROVAL_CHOICE_MAP.get(action_name, "deny")
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
@@ -2796,9 +2915,27 @@ class FeishuAdapter(BasePlatformAdapter):
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         user_name = self._get_cached_sender_name(open_id) or open_id
+        command_preview = str(state.get("command_preview", "") or "")
+        description = str(state.get("description", "") or "")
+
+        if state.get("status") == "resolving":
+            # A previous click already won the race. Return the same disabled
+            # clicked-state card and do not schedule a second approval resolver.
+            return self._build_card_callback_response(
+                self._build_resolved_approval_card(
+                    choice=str(state.get("choice") or choice),
+                    user_name=str(state.get("user_name") or user_name),
+                    approval_id=approval_id,
+                    command_preview=command_preview,
+                    description=description,
+                )
+            )
 
         chat_context = getattr(event, "context", None)
         chat_id = str(getattr(chat_context, "open_chat_id", "") or "")
+        state["status"] = "resolving"
+        state["choice"] = choice
+        state["user_name"] = user_name
         if not self._submit_on_loop(
             loop,
             self._resolve_approval(
@@ -2809,17 +2946,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
             ),
         ):
+            state.pop("status", None)
+            state.pop("choice", None)
+            state.pop("user_name", None)
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        if P2CardActionTriggerResponse is None:
-            return None
-        response = P2CardActionTriggerResponse()
-        if CallBackCard is not None:
-            card = CallBackCard()
-            card.type = "raw"
-            card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
-            response.card = card
-        return response
+        return self._build_card_callback_response(
+            self._build_resolved_approval_card(
+                choice=choice,
+                user_name=user_name,
+                approval_id=approval_id,
+                command_preview=command_preview,
+                description=description,
+            )
+        )
 
     def _handle_update_prompt_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule update prompt resolution and build the synchronous callback response."""
@@ -2917,6 +3057,7 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
+            return
 
     async def _resolve_update_prompt(
         self,
