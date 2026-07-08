@@ -3451,7 +3451,27 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "root_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_to_text = None
+        reply_media_urls: List[str] = []
+        reply_media_types: List[str] = []
+        reply_media_type = MessageType.TEXT
+        if reply_to_message_id:
+            (
+                reply_to_text,
+                reply_media_urls,
+                reply_media_types,
+                reply_media_type,
+            ) = await self._fetch_message_context(reply_to_message_id, include_media=True)
+            if reply_media_urls and not media_urls and inbound_type == MessageType.TEXT:
+                # A very common Feishu/Lark UX is: upload a file, then reply to
+                # that file with "can you read this?".  The current trigger is a
+                # text message, but the referenced file is the real user input.
+                # Carry the parent resource forward so downstream document/image
+                # preprocessing sees the same attachment it would have received
+                # had the user uploaded it in the trigger message itself.
+                media_urls = reply_media_urls
+                media_types = reply_media_types
+                inbound_type = reply_media_type
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -4345,11 +4365,23 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+        text, _media_urls, _media_types, _message_type = await self._fetch_message_context(
+            message_id,
+            include_media=False,
+        )
+        return text
+
+    async def _fetch_message_context(
+        self,
+        message_id: str,
+        *,
+        include_media: bool = False,
+    ) -> tuple[Optional[str], List[str], List[str], MessageType]:
         if not self._client or not message_id:
-            return None
-        if message_id in self._message_text_cache:
+            return None, [], [], MessageType.TEXT
+        if not include_media and message_id in self._message_text_cache:
             self._message_text_cache.move_to_end(message_id)
-            return self._message_text_cache[message_id]
+            return self._message_text_cache[message_id], [], [], MessageType.TEXT
         try:
             request = self._build_get_message_request(message_id)
             response = await asyncio.to_thread(self._client.im.v1.message.get, request)
@@ -4357,25 +4389,50 @@ class FeishuAdapter(BasePlatformAdapter):
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
                 logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
+                return None, [], [], MessageType.TEXT
             items = getattr(getattr(response, "data", None), "items", None) or []
             parent = items[0] if items else None
             body = getattr(parent, "body", None)
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type,
+            normalized = normalize_feishu_message(
+                message_type=msg_type,
                 raw_content=raw_content,
                 mentions=parent_mentions,
+                bot=self._bot_identity(),
             )
-            self._message_text_cache[message_id] = text
-            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
-                self._message_text_cache.popitem(last=False)
-            return text
+            text = normalized.text_content
+            if not text:
+                placeholder = (
+                    normalized.metadata.get("placeholder_text")
+                    if isinstance(normalized.metadata, dict)
+                    else None
+                )
+                text = str(placeholder).strip() or ""
+            cached_text = text or None
+            if cached_text is not None:
+                self._message_text_cache[message_id] = cached_text
+                while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
+                    self._message_text_cache.popitem(last=False)
+
+            if not include_media:
+                return cached_text, [], [], MessageType.TEXT
+
+            media_urls, media_types = await self._download_feishu_message_resources(
+                message_id=message_id,
+                normalized=normalized,
+            )
+            message_type = self._resolve_normalized_message_type(normalized, media_types)
+            if media_urls and message_type == MessageType.TEXT:
+                message_type = self._resolve_media_message_type(
+                    media_types[0] if media_types else "",
+                    default=MessageType.DOCUMENT,
+                )
+            return cached_text, media_urls, media_types, message_type
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
+            return None, [], [], MessageType.TEXT
 
     def _extract_text_from_raw_content(
         self,

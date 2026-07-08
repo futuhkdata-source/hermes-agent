@@ -1466,6 +1466,74 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(attachment, "[Attachment: report.pdf]")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_text_reply_to_file_message_attaches_parent_file_resource(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        parent = SimpleNamespace(
+            msg_type="file",
+            body=SimpleNamespace(content='{"file_key":"file_doc","file_name":"TCCL ISO 2026.xlsx"}'),
+            mentions=None,
+        )
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[parent]))
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(get=Mock(return_value=response))))
+        )
+        adapter._build_get_message_request = Mock(return_value=object())
+        adapter._download_feishu_message_resource = AsyncMock(
+            return_value=(
+                "/tmp/doc_123_TCCL ISO 2026.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        )
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Tender", "type": "group"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u_human", "user_name": "Human", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_tender",
+            thread_id=None,
+            parent_id="om_parent_file",
+            upper_message_id=None,
+            root_id="om_parent_file",
+            message_type="text",
+            content='{"text":"這個excel 能讀到嗎"}',
+            mentions=[],
+            message_id="om_child_text",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="group",
+                message_id="om_child_text",
+            )
+        )
+
+        adapter._dispatch_inbound_event.assert_awaited_once()
+        await_args = adapter._dispatch_inbound_event.await_args
+        assert await_args is not None
+        dispatched = await_args.args[0]
+        self.assertEqual(dispatched.reply_to_text, "[Attachment: TCCL ISO 2026.xlsx]")
+        self.assertEqual(dispatched.message_type.value, "document")
+        self.assertEqual(dispatched.media_urls, ["/tmp/doc_123_TCCL ISO 2026.xlsx"])
+        self.assertEqual(
+            dispatched.media_types,
+            ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        )
+        adapter._download_feishu_message_resource.assert_awaited_once_with(
+            message_id="om_parent_file",
+            file_key="file_doc",
+            resource_type="file",
+            fallback_filename="TCCL ISO 2026.xlsx",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_text_message_starting_with_slash_becomes_command(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1955,6 +2023,7 @@ class TestAdapterBehavior(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_process_inbound_message_fetches_reply_to_text(self):
         from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
@@ -1965,7 +2034,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
         )
-        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        adapter._fetch_message_context = AsyncMock(return_value=("父消息内容", [], [], MessageType.TEXT))
         message = SimpleNamespace(
             chat_id="oc_chat",
             thread_id=None,
