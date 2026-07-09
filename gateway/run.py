@@ -2112,8 +2112,8 @@ def _load_gateway_runtime_config() -> dict:
 
     Runtime helpers should honor the same env-template expansion documented for
     ``config.yaml`` while still respecting tests that monkeypatch
-    ``gateway.run._hermes_home``. Build on ``_load_gateway_config()`` rather
-    than calling the canonical loader directly so both behaviors stay aligned.
+    ``gateway.run._hermes_home``. Build on ``_load_gateway_config()``
+    rather than calling the canonical loader directly so both behaviors stay aligned.
 
     Expansion failures are intentionally NOT swallowed — silently returning
     the unexpanded dict would mask the very bug this helper exists to fix.
@@ -2125,6 +2125,62 @@ def _load_gateway_runtime_config() -> dict:
 
     expanded = _expand_env_vars(cfg)
     return expanded if isinstance(expanded, dict) else {}
+
+
+def _runtime_footer_profile_for_source(source: Optional[SessionSource]) -> str:
+    """Resolve the profile label to render in gateway runtime footers."""
+    routed_profile = str(getattr(source, "profile", None) or "").strip()
+    if routed_profile:
+        return routed_profile
+    return os.environ.get("HERMES_PROFILE", "default")
+
+
+def _load_runtime_footer_config_for_source(source: Optional[SessionSource]) -> dict:
+    """Load footer config from the routed profile when source.profile is set."""
+    routed_profile = str(getattr(source, "profile", None) or "").strip()
+    if not routed_profile:
+        return _load_gateway_config()
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        with _profile_runtime_scope(get_profile_dir(routed_profile)):
+            return _load_gateway_config()
+    except Exception as exc:
+        logger.debug(
+            "runtime_footer profile config fallback for %s failed: %s",
+            routed_profile,
+            exc,
+        )
+        return _load_gateway_config()
+
+
+def _build_runtime_footer_for_source(
+    *,
+    source: SessionSource,
+    agent_result: dict,
+) -> str:
+    """Build the final-message runtime footer for a gateway source.
+
+    Native department routes run inside the routed profile's agent scope, but
+    the surrounding gateway response renderer continues in the default gateway
+    process.  Footer identity must therefore come from ``source.profile`` rather
+    than process-global ``HERMES_PROFILE``.
+    """
+    from gateway.runtime_footer import build_footer_line as _bfl
+
+    return _bfl(
+        user_config=_load_runtime_footer_config_for_source(source),
+        platform_key=_platform_config_key(source.platform),
+        model=agent_result.get("model"),
+        provider=agent_result.get("provider"),
+        profile=_runtime_footer_profile_for_source(source),
+        reasoning=agent_result.get("reasoning") or agent_result.get("reasoning_effort"),
+        context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+        context_length=agent_result.get("context_length") or None,
+        compression_count=agent_result.get("compression_count"),
+        rate_limit_budget=agent_result.get("rate_limit_budget"),
+        cwd=os.environ.get("TERMINAL_CWD", ""),
+    )
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
@@ -9730,19 +9786,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    provider=agent_result.get("provider"),
-                    profile=os.environ.get("HERMES_PROFILE", "default"),
-                    reasoning=agent_result.get("reasoning") or agent_result.get("reasoning_effort"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    compression_count=agent_result.get("compression_count"),
-                    rate_limit_budget=agent_result.get("rate_limit_budget"),
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
+                _footer_line = _build_runtime_footer_for_source(
+                    source=source,
+                    agent_result=agent_result,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

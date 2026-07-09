@@ -409,3 +409,28 @@ def test_load_gateway_config_honors_profile_runtime_scope(tmp_path, monkeypatch)
         assert gateway_run._load_gateway_config()["marker"] == "profile"
     finally:
         reset_hermes_home_override(token)
+
+
+def test_runtime_footer_uses_routed_source_profile(monkeypatch):
+    """Native-routed Feishu replies must show the routed profile, not gateway default."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"runtime_footer": {"enabled": True, "fields": ["profile"]}}},
+    )
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="dept-chat",
+        chat_type="group",
+        profile="tender-agent",
+    )
+
+    footer = gateway_run._build_runtime_footer_for_source(
+        source=source,
+        agent_result={"model": "gpt-5.5", "provider": "openai-codex"},
+    )
+
+    assert footer == "tender-agent"
