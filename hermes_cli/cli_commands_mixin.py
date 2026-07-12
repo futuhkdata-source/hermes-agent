@@ -2083,7 +2083,7 @@ class CLICommandsMixin:
             display_state = "on ✓" if self.show_reasoning else "off"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state}{_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|show|hide>{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide>{_RST}")
             return
 
         arg = parts[1].strip().lower()
