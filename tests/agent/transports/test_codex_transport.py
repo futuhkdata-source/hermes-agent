@@ -75,6 +75,106 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning", {}).get("effort") == "high"
 
+    def test_codex_backend_clamps_max_to_xhigh_for_gpt_5_4(self, transport):
+        """A gpt-5.6 max session must remain usable after fallback to gpt-5.4."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "max"},
+        )
+        mini = transport.build_kwargs(
+            model="gpt-5.4-mini",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "max"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "xhigh"
+        assert mini.get("reasoning", {}).get("effort") == "xhigh"
+
+    def test_codex_backend_does_not_treat_lookalikes_as_gpt_5_6(self, transport):
+        """Capability matching is delimiter-bounded, not a loose prefix test."""
+        messages = [{"role": "user", "content": "Hi"}]
+        version_lookalike = transport.build_kwargs(
+            model="gpt-5.60",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "max"},
+        )
+        variant_lookalike = transport.build_kwargs(
+            model="gpt-5.6-solar",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "ultra"},
+        )
+        assert version_lookalike.get("reasoning", {}).get("effort") == "xhigh"
+        assert variant_lookalike.get("reasoning", {}).get("effort") == "xhigh"
+
+    def test_codex_backend_preserves_max_for_gpt_5_6(self, transport):
+        """The primary gpt-5.6 family supports max and must not be downgraded."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "max"},
+        )
+        snapshot = transport.build_kwargs(
+            model="openai/gpt-5.6-terra-2026-07-15",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "max"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "max"
+        assert snapshot.get("reasoning", {}).get("effort") == "max"
+
+    def test_non_codex_backend_does_not_apply_codex_catalog_clamp(self, transport):
+        """Direct/OpenAI-compatible Responses endpoints retain caller intent."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            is_codex_backend=False,
+            reasoning_config={"effort": "max"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "max"
+
+    def test_codex_backend_clamps_ultra_to_supported_lower_model_effort(self, transport):
+        """Ultra falls back to the highest effort each Codex model accepts."""
+        messages = [{"role": "user", "content": "Hi"}]
+        older = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "ultra"},
+        )
+        luna = transport.build_kwargs(
+            model="gpt-5.6-luna",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "ultra"},
+        )
+        sol = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "ultra"},
+        )
+        assert older.get("reasoning", {}).get("effort") == "xhigh"
+        assert luna.get("reasoning", {}).get("effort") == "max"
+        assert sol.get("reasoning", {}).get("effort") == "ultra"
+
     def test_reasoning_disabled(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

@@ -11,6 +11,39 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
+def _clamp_codex_backend_reasoning_effort(model: str, effort: str) -> str:
+    """Return the strongest reasoning effort accepted by a Codex model.
+
+    The live Codex catalog currently exposes ``max`` only on gpt-5.6-sol,
+    gpt-5.6-terra, and gpt-5.6-luna (including snapshot variants), and
+    ``ultra`` only on gpt-5.6-sol / gpt-5.6-terra.  A session can legitimately
+    retain its primary model's effort while Hermes switches to a lower fallback
+    model, so clamp at request construction rather than mutate the session-level
+    preference.  The primary receives its original effort again when it is
+    restored on the next turn.
+    """
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    normalized = str(effort or "").strip().lower()
+
+    max_slugs = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+    supports_max = any(
+        name == slug or name.startswith(f"{slug}-") for slug in max_slugs
+    )
+    supports_ultra = any(
+        name == slug or name.startswith(f"{slug}-") for slug in max_slugs[:2]
+    )
+
+    if normalized == "max" and not supports_max:
+        return "xhigh"
+    if normalized == "ultra":
+        if supports_ultra:
+            return "ultra"
+        if supports_max:
+            return "max"
+        return "xhigh"
+    return normalized
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -126,6 +159,10 @@ class ResponsesApiTransport(ProviderTransport):
 
         _effort_clamp = {"minimal": "low"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+        if is_codex_backend:
+            reasoning_effort = _clamp_codex_backend_reasoning_effort(
+                model, reasoning_effort
+            )
 
         response_tools = _responses_tools(tools)
 
