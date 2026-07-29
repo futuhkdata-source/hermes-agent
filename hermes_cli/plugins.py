@@ -139,6 +139,9 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Metadata-only, always-fired end-of-turn observer. Unlike post_llm_call,
+    # this also covers failed, interrupted, empty, and budget-exhausted turns.
+    "on_turn_end",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",

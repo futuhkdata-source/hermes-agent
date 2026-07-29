@@ -73,8 +73,17 @@ class TestApiModeAccepted:
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
+        hook_calls = []
+
+        def record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
         # No background review fork during tests
-        with patch.object(agent, "_spawn_background_review", return_value=None):
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=record_hook),
+        ):
             result = agent.run_conversation("hello there")
         assert result["final_response"] == "echo: hello there"
         assert result["completed"] is True
@@ -83,6 +92,11 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+        turn_end = [kwargs for name, kwargs in hook_calls if name == "on_turn_end"]
+        assert len(turn_end) == 1
+        assert turn_end[0]["completed"] is True
+        assert turn_end[0]["failed"] is False
+        assert turn_end[0]["turn_exit_reason"] == "completed"
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):

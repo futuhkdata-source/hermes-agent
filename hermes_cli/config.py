@@ -1015,6 +1015,20 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
+
+    # Optional local execution-lifecycle observer. Disabled by default and
+    # strictly shadow-only: it records phase/budget/completion signals through
+    # existing plugin hooks but never blocks, rewrites, or schedules work.
+    "execution_shadow": {
+        "enabled": False,
+        "mode": "shadow",
+        "scope_freeze_ratio": 0.60,
+        "closure_ratio": 0.75,
+        "finalization_ratio": 0.85,
+        "max_reviewers": 1,
+        "max_remediations": 1,
+        "max_event_file_bytes": 5_000_000,
+    },
     
     "terminal": {
         "backend": "local",

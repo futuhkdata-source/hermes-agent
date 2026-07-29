@@ -3489,6 +3489,9 @@ class TestRunConversation:
         assert len(post_request_calls) == 2
         assert [call["api_call_count"] for call in pre_request_calls] == [1, 2]
         assert [call["api_call_count"] for call in post_request_calls] == [1, 2]
+        assert [call["budget_used"] for call in pre_request_calls] == [1, 2]
+        assert [call["budget_used"] for call in post_request_calls] == [1, 2]
+        assert all(call["budget_max"] == agent.max_iterations for call in pre_request_calls + post_request_calls)
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all(call["turn_id"] == pre_request_calls[0]["turn_id"] for call in pre_request_calls + post_request_calls)
         assert [call["api_request_id"] for call in pre_request_calls] == [
@@ -3499,6 +3502,22 @@ class TestRunConversation:
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
+
+        post_turn_calls = [kw for name, kw in hook_calls if name == "post_llm_call"]
+        assert len(post_turn_calls) == 1
+        assert post_turn_calls[0]["assistant_response"] == "Done searching"
+
+        turn_end_calls = [kw for name, kw in hook_calls if name == "on_turn_end"]
+        assert len(turn_end_calls) == 1
+        turn_end = turn_end_calls[0]
+        assert turn_end["completed"] is True
+        assert turn_end["failed"] is False
+        assert turn_end["interrupted"] is False
+        assert turn_end["api_call_count"] == 2
+        assert turn_end["budget_used"] == 2
+        assert turn_end["budget_max"] == agent.max_iterations
+        assert turn_end["turn_exit_reason"] == "text_response"
+        assert turn_end["final_response_present"] is True
 
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
@@ -6664,7 +6683,7 @@ class TestDeadRetryCode:
 
     def test_no_unreachable_max_retries_after_backoff(self):
         import inspect
-        from agent.conversation_loop import run_conversation as _rc
+        from agent.conversation_loop import _run_conversation_impl as _rc
         source = inspect.getsource(_rc)
         occurrences = source.count("if retry_count >= max_retries:")
         assert occurrences == 2, (

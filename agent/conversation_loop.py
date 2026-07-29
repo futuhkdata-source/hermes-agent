@@ -466,7 +466,7 @@ def _content_policy_blocked_result(
     }
 
 
-def run_conversation(
+def _run_conversation_impl(
     agent,
     user_message: str,
     system_message: str = None,
@@ -1046,6 +1046,8 @@ def run_conversation(
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
+                            budget_used=agent.iteration_budget.used,
+                            budget_max=agent.iteration_budget.max_total,
                             request_messages=list(request_messages)
                             if isinstance(request_messages, list)
                             else [],
@@ -3574,6 +3576,8 @@ def run_conversation(
                         base_url=agent.base_url,
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
+                        budget_used=agent.iteration_budget.used,
+                        budget_max=agent.iteration_budget.max_total,
                         api_duration=api_duration,
                         started_at=api_start_time,
                         ended_at=_api_ended_at,
@@ -4482,5 +4486,122 @@ def run_conversation(
     )
 
 
+_TURN_END_REASON_CODES = {
+    "all_retries_exhausted_no_response",
+    "budget_exhausted",
+    "completed",
+    "content_policy_blocked",
+    "empty_response_exhausted",
+    "error_near_max_iterations",
+    "failed",
+    "fallback_prior_turn_content",
+    "guardrail_halt",
+    "incomplete",
+    "interrupted",
+    "interrupted_by_user",
+    "interrupted_during_api_call",
+    "max_iterations_reached",
+    "ollama_runtime_context_too_small",
+    "partial_stream_recovery",
+    "text_response",
+    "unhandled_exception",
+    "unknown",
+}
+
+
+def _canonical_turn_end_reason(result: Dict[str, Any]) -> str:
+    raw = str(result.get("turn_exit_reason") or "").strip().lower()
+    base = raw.split("(", 1)[0].split(":", 1)[0].strip()
+    base = re.sub(r"[^a-z0-9_]+", "_", base).strip("_")
+    if base in _TURN_END_REASON_CODES:
+        return base
+    if result.get("interrupted") is True:
+        return "interrupted"
+    if result.get("completed") is True:
+        return "completed"
+    if result.get("failed") is True or result.get("error"):
+        return "failed"
+    return "incomplete"
+
+
+def _emit_turn_end(agent, result: Dict[str, Any], *, reason: str | None = None) -> None:
+    """Emit one metadata-only terminal event without affecting turn results."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        final_response = result.get("final_response")
+        response_present = bool(
+            final_response.strip() if isinstance(final_response, str) else final_response
+        )
+        budget = getattr(agent, "iteration_budget", None)
+        invoke_hook(
+            "on_turn_end",
+            session_id=getattr(agent, "session_id", None) or "",
+            task_id=getattr(agent, "_current_task_id", None) or "",
+            turn_id=getattr(agent, "_current_turn_id", None) or "",
+            model=getattr(agent, "model", "") or "",
+            platform=getattr(agent, "platform", None) or "",
+            completed=result.get("completed") is True,
+            failed=(
+                result.get("failed") is True
+                or bool(result.get("error"))
+                or reason == "unhandled_exception"
+            ),
+            interrupted=result.get("interrupted") is True,
+            turn_exit_reason=reason or _canonical_turn_end_reason(result),
+            api_call_count=int(
+                result.get("api_calls")
+                if result.get("api_calls") is not None
+                else getattr(agent, "_api_call_count", 0) or 0
+            ),
+            budget_used=int(getattr(budget, "used", 0) or 0),
+            budget_max=int(getattr(budget, "max_total", 0) or 0),
+            final_response_present=response_present,
+            final_response_chars=(
+                len(final_response) if isinstance(final_response, str) else 0
+            ),
+        )
+    except Exception:
+        logger.debug("on_turn_end hook failed open", exc_info=True)
+
+
+def run_conversation(
+    agent,
+    user_message: str,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Run one turn and emit ``on_turn_end`` exactly once for every return path."""
+    try:
+        result = _run_conversation_impl(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+        )
+    except Exception:
+        _emit_turn_end(
+            agent,
+            {
+                "completed": False,
+                "failed": True,
+                "interrupted": False,
+                "api_calls": getattr(agent, "_api_call_count", 0) or 0,
+                "final_response": None,
+            },
+            reason="unhandled_exception",
+        )
+        raise
+
+    _emit_turn_end(agent, result)
+    return result
 
 __all__ = ["run_conversation"]

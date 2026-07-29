@@ -1,0 +1,16 @@
+name: execution-shadow
+version: "0.1.0"
+description: "Local, profile-scoped shadow telemetry for execution phase, budget gates, helper/review counts, completion evidence, and closure-contract warnings. Never changes control flow."
+author: NousResearch / Hermes
+kind: standalone
+hooks:
+  - pre_llm_call
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
+  - on_turn_end
+  - subagent_start
+  - subagent_stop

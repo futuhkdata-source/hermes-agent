@@ -2219,6 +2219,8 @@ class AIAgent:
                 base_url=self.base_url,
                 api_mode=self.api_mode,
                 api_call_count=api_call_count,
+                budget_used=self.iteration_budget.used,
+                budget_max=self.iteration_budget.max_total,
                 api_duration=ended_at - api_start_time,
                 started_at=api_start_time,
                 ended_at=ended_at,
