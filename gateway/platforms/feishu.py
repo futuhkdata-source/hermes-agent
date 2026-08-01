@@ -3519,7 +3519,16 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._dispatch_inbound_event(normalized)
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
-        """Apply Feishu-specific burst protection before entering the base adapter."""
+        """Prepare routing/session state, then apply Feishu burst protection."""
+        event, pre_dispatch_skip = self._prepare_event_for_session_key(event)
+        if pre_dispatch_skip:
+            return
+        anchor_message_ids = list(
+            getattr(event, "_session_anchor_message_ids", None) or []
+        )
+        if event.message_id and str(event.message_id) not in anchor_message_ids:
+            anchor_message_ids.append(str(event.message_id))
+        event._session_anchor_message_ids = anchor_message_ids  # type: ignore[attr-defined]
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
             return
@@ -3545,8 +3554,14 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=(getattr(event.source, "profile", None) or None),
         )
-        return f"{session_key}:media:{event.message_type.value}"
+        sender_id = (
+            getattr(event.source, "user_id_alt", None)
+            or getattr(event.source, "user_id", None)
+            or f"message:{event.message_id or id(event)}"
+        )
+        return f"{session_key}:sender:{sender_id}:media:{event.message_type.value}"
 
     @staticmethod
     def _media_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
@@ -3571,6 +3586,13 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
+        existing_anchor_ids = list(
+            getattr(existing, "_session_anchor_message_ids", None) or []
+        )
+        for message_id in getattr(event, "_session_anchor_message_ids", None) or []:
+            if message_id not in existing_anchor_ids:
+                existing_anchor_ids.append(message_id)
+        existing._session_anchor_message_ids = existing_anchor_ids  # type: ignore[attr-defined]
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
         existing.timestamp = event.timestamp
@@ -3830,11 +3852,18 @@ class FeishuAdapter(BasePlatformAdapter):
         """Return the session-scoped key used for Feishu text aggregation."""
         from gateway.session import build_session_key
 
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=(getattr(event.source, "profile", None) or None),
         )
+        sender_id = (
+            getattr(event.source, "user_id_alt", None)
+            or getattr(event.source, "user_id", None)
+            or f"message:{event.message_id or id(event)}"
+        )
+        return f"{session_key}:sender:{sender_id}"
 
     @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
@@ -3877,6 +3906,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
         existing.text = next_text
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+        existing_anchor_ids = list(
+            getattr(existing, "_session_anchor_message_ids", None) or []
+        )
+        for message_id in getattr(event, "_session_anchor_message_ids", None) or []:
+            if message_id not in existing_anchor_ids:
+                existing_anchor_ids.append(message_id)
+        existing._session_anchor_message_ids = existing_anchor_ids  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
         if event.message_id:
             existing.message_id = event.message_id

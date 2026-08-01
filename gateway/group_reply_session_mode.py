@@ -138,11 +138,24 @@ def record_group_message_anchor(
     now = _utc_now()
     expires_at = (now + timedelta(days=max(1, int(ttl_days)))).isoformat()
     key = _message_key(platform, chat_type, str(chat_id), str(message_id))
+    platform_value = getattr(platform, "value", platform)
+    anchor_prefix = f"{platform_value}:{chat_type}:{chat_id}:"
+    anchor_value = str(anchor_id)
     with _LOCK:
         data = _load_json(path)
         _purge_expired(data, now=now)
+        # Sliding idle retention: activity on any message in an anchor refreshes
+        # every message ID that can resume that same conversation.
+        for existing_key, existing_row in data.items():
+            if (
+                existing_key.startswith(anchor_prefix)
+                and isinstance(existing_row, dict)
+                and str(existing_row.get("anchor_id") or "") == anchor_value
+            ):
+                existing_row["updated_at"] = now.isoformat()
+                existing_row["expires_at"] = expires_at
         data[key] = {
-            "anchor_id": str(anchor_id),
+            "anchor_id": anchor_value,
             "updated_at": now.isoformat(),
             "expires_at": expires_at,
         }

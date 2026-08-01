@@ -5,6 +5,7 @@ agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"|"route"}.
 """
 
+import asyncio
 import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -434,3 +435,141 @@ def test_runtime_footer_uses_routed_source_profile(monkeypatch):
     )
 
     assert footer == "tender-agent"
+
+
+@pytest.mark.asyncio
+async def test_authorized_feishu_inbound_anchor_is_persisted_after_auth(
+    tmp_path, monkeypatch
+):
+    from gateway.group_reply_session_mode import resolve_group_reply_anchor
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "*")
+
+    event = MessageEvent(
+        text="hello",
+        message_id="dm-root",
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="dm-chat",
+            chat_type="dm",
+            user_id="allowed-user",
+            message_id="dm-root",
+            session_anchor_id="dm-root",
+        ),
+    )
+    event._session_anchor_message_ids = ["dm-first", "dm-root"]  # type: ignore[attr-defined]
+    runner, _adapter = _make_runner(Platform.FEISHU)
+
+    async def _capture(*_args, **_kwargs):
+        return "ok"
+
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    assert await runner._handle_message(event) == "ok"  # noqa: SLF001
+    assert resolve_group_reply_anchor(
+        platform=Platform.FEISHU,
+        chat_type="dm",
+        chat_id="dm-chat",
+        reply_to_message_id="dm-root",
+    ) == "dm-root"
+    assert resolve_group_reply_anchor(
+        platform=Platform.FEISHU,
+        chat_type="dm",
+        chat_id="dm-chat",
+        reply_to_message_id="dm-first",
+    ) == "dm-root"
+
+
+@pytest.mark.asyncio
+async def test_feishu_prepares_owner_route_and_anchor_before_text_batching(monkeypatch):
+    """Feishu batching must never key on stale native thread/default profile state."""
+    from gateway.platforms.feishu import FeishuAdapter
+
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {
+                    "action": "route",
+                    "profile": "purchase-agent",
+                    "skip_auth": True,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.FEISHU)
+    adapter = FeishuAdapter(PlatformConfig(enabled=True))
+    adapter.set_message_handler(runner._handle_message)
+    captured = {}
+
+    async def _capture_enqueue(event):
+        captured["profile"] = event.source.profile
+        captured["anchor"] = event.source.session_anchor_id
+        captured["thread"] = event.source.thread_id
+
+    adapter._enqueue_text_event = _capture_enqueue  # noqa: SLF001
+    await adapter._dispatch_inbound_event(_make_department_group_event())  # noqa: SLF001
+
+    assert captured == {
+        "profile": "purchase-agent",
+        "anchor": "msg-root",
+        "thread": None,
+    }
+
+
+def test_feishu_text_batch_key_never_merges_different_senders():
+    from gateway.platforms.feishu import FeishuAdapter
+
+    adapter = FeishuAdapter(PlatformConfig(enabled=True))
+    common = {
+        "platform": Platform.FEISHU,
+        "chat_id": "dept-chat",
+        "chat_type": "group",
+        "session_anchor_id": "msg-root",
+        "profile": "purchase-agent",
+    }
+    event_a = MessageEvent(
+        text="one",
+        message_id="msg-a",
+        source=SessionSource(user_id="user-a", **common),
+    )
+    event_b = MessageEvent(
+        text="two",
+        message_id="msg-b",
+        source=SessionSource(user_id="user-b", **common),
+    )
+
+    assert adapter._text_batch_key(event_a) != adapter._text_batch_key(event_b)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_feishu_reply_batch_preserves_every_source_message_id():
+    from gateway.platforms.feishu import FeishuAdapter
+
+    adapter = FeishuAdapter(PlatformConfig(enabled=True))
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="dept-chat",
+        chat_type="group",
+        user_id="user-a",
+        session_anchor_id="msg-root",
+        profile="purchase-agent",
+    )
+    first = MessageEvent(text="one", message_id="msg-a", source=source)
+    second = MessageEvent(text="two", message_id="msg-b", source=source)
+    first._session_anchor_message_ids = ["msg-a"]  # type: ignore[attr-defined]
+    second._session_anchor_message_ids = ["msg-b"]  # type: ignore[attr-defined]
+
+    await adapter._enqueue_text_event(first)  # noqa: SLF001
+    await adapter._enqueue_text_event(second)  # noqa: SLF001
+    assert len(adapter._pending_text_batches) == 1  # noqa: SLF001
+    pending = next(iter(adapter._pending_text_batches.values()))  # noqa: SLF001
+    assert pending._session_anchor_message_ids == ["msg-a", "msg-b"]  # type: ignore[attr-defined]
+
+    tasks = list(adapter._pending_text_batch_tasks.values())  # noqa: SLF001
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)

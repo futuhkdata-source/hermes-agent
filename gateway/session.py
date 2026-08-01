@@ -665,9 +665,10 @@ def build_session_key(
 
     DM rules:
       - DMs include chat_id when present, so each private conversation is isolated.
-      - thread_id further differentiates threaded DMs within the same DM chat.
-      - Without chat_id, thread_id is used as a best-effort fallback.
-      - Without thread_id or chat_id, DMs share a single session.
+      - session_anchor_id selects a message-anchored DM lane when present.
+      - Otherwise thread_id differentiates native threaded DMs within the same DM chat.
+      - Without chat_id, the same lane selection is used as a best-effort fallback.
+      - Without a lane or chat_id, DMs share a single session.
 
     Group/channel rules:
       - chat_id identifies the parent group/channel.
@@ -688,10 +689,13 @@ def build_session_key(
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
             dm_chat_id = canonical_whatsapp_identifier(source.chat_id)
+        dm_lane_id = getattr(source, "session_anchor_id", None) or getattr(
+            source, "thread_id", None
+        )
 
         if dm_chat_id:
-            if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
+            if dm_lane_id:
+                return f"{ns}:{platform}:dm:{dm_chat_id}:{dm_lane_id}"
             return f"{ns}:{platform}:dm:{dm_chat_id}"
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
@@ -706,11 +710,11 @@ def build_session_key(
                 or dm_participant_id
             )
         if dm_participant_id:
-            if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
+            if dm_lane_id:
+                return f"{ns}:{platform}:dm:{dm_participant_id}:{dm_lane_id}"
             return f"{ns}:{platform}:dm:{dm_participant_id}"
-        if source.thread_id:
-            return f"{ns}:{platform}:dm:{source.thread_id}"
+        if dm_lane_id:
+            return f"{ns}:{platform}:dm:{dm_lane_id}"
         return f"{ns}:{platform}:dm"
 
     participant_id = source.user_id_alt or source.user_id

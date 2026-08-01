@@ -17,7 +17,7 @@ import asyncio
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 
 
@@ -42,10 +42,10 @@ class _StubAdapter(BasePlatformAdapter):
         return {}
 
 
-def _make_adapter():
+def _make_adapter(platform: Platform = Platform.TELEGRAM):
     """Create a minimal adapter for testing the active-session guard."""
     config = PlatformConfig(enabled=True, token="test-token")
-    adapter = _StubAdapter(config, Platform.TELEGRAM)
+    adapter = _StubAdapter(config, platform)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
 
@@ -57,6 +57,7 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        return SendResult(success=True, message_id=f"sent-{len(adapter.sent_responses)}")
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -159,6 +160,50 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:status" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_feishu_bypass_command_response_is_reply_anchored(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.group_reply_session_mode import (
+            record_group_message_anchor,
+            resolve_group_reply_anchor,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        record_group_message_anchor(
+            platform=Platform.FEISHU,
+            chat_type="dm",
+            chat_id="dm-chat",
+            message_id="prior-bot-message",
+            anchor_id="dm-root",
+        )
+        adapter = _make_adapter(Platform.FEISHU)
+        event = MessageEvent(
+            text="/status",
+            message_type=MessageType.COMMAND,
+            message_id="command-message",
+            reply_to_message_id="prior-bot-message",
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="dm-chat",
+                chat_type="dm",
+                user_id="owner",
+                thread_id="native-thread-must-not-fork",
+                message_id="command-message",
+            ),
+        )
+        session_key = "agent:main:feishu:dm:dm-chat:dm-root"
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter.handle_message(event)
+
+        assert resolve_group_reply_anchor(
+            platform=Platform.FEISHU,
+            chat_type="dm",
+            chat_id="dm-chat",
+            reply_to_message_id="sent-1",
+        ) == "dm-root"
 
     @pytest.mark.asyncio
     async def test_agents_bypasses_guard(self):

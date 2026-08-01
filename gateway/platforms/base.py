@@ -3902,6 +3902,7 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
+                self._record_outbound_message_anchor(event, _r)
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -3928,13 +3929,13 @@ class BasePlatformAdapter(ABC):
         await self._drain_pending_after_session_command(session_key, command_guard)
 
     def _apply_group_reply_session_mode(self, event: MessageEvent) -> MessageEvent:
-        """Normalize Feishu group replies onto message-anchored shared sessions."""
+        """Normalize Feishu DM/group replies onto message-anchored sessions."""
         source = getattr(event, "source", None)
         if source is None:
             return event
         if getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)) != "feishu":
             return event
-        if getattr(source, "chat_type", None) != "group":
+        if getattr(source, "chat_type", None) not in {"dm", "group"}:
             return event
         message_id = getattr(event, "message_id", None) or getattr(source, "message_id", None)
         reply_to_message_id = getattr(event, "reply_to_message_id", None)
@@ -3950,17 +3951,9 @@ class BasePlatformAdapter(ABC):
             anchor_id = str(message_id or "").strip() or None
         if not anchor_id:
             return event
-        if message_id:
-            try:
-                record_group_message_anchor(
-                    platform=source.platform,
-                    chat_type=source.chat_type,
-                    chat_id=source.chat_id,
-                    message_id=str(message_id),
-                    anchor_id=anchor_id,
-                )
-            except Exception:
-                logger.debug("[%s] Failed to record inbound group message anchor", self.name, exc_info=True)
+        # Deliberately do not persist the inbound mapping here. This method
+        # runs before gateway user authorization (and before Feishu batching).
+        # GatewayRunner records the mapping immediately after authorization.
         if getattr(source, "session_anchor_id", None) == anchor_id and getattr(source, "thread_id", None) is None:
             return event
         new_source = dataclasses.replace(
@@ -3971,17 +3964,41 @@ class BasePlatformAdapter(ABC):
         )
         return dataclasses.replace(event, source=new_source)
 
-    async def handle_message(self, event: MessageEvent) -> None:
-        """
-        Process an incoming message.
-        
-        This method returns quickly by spawning background tasks.
-        This allows new messages to be processed even while an agent is running,
-        enabling interruption support.
-        """
-        if not self._message_handler:
+    def _record_outbound_message_anchor(
+        self, event: MessageEvent, result: Optional[SendResult]
+    ) -> None:
+        """Persist a successful user-visible send on the event's session anchor."""
+        if result is None or not getattr(result, "success", False):
             return
+        message_id = getattr(result, "message_id", None)
+        source = getattr(event, "source", None)
+        anchor_id = getattr(source, "session_anchor_id", None) if source is not None else None
+        if not message_id or not anchor_id or source is None:
+            return
+        try:
+            record_group_message_anchor(
+                platform=source.platform,
+                chat_type=source.chat_type,
+                chat_id=source.chat_id,
+                message_id=str(message_id),
+                anchor_id=str(anchor_id),
+            )
+        except Exception:
+            logger.debug(
+                "[%s] Failed to record outbound Feishu message anchor",
+                self.name,
+                exc_info=True,
+            )
 
+    def _prepare_event_for_session_key(
+        self, event: MessageEvent
+    ) -> tuple[MessageEvent, bool]:
+        """Normalize routing/session state before any adapter computes a key.
+
+        Feishu calls this before burst batching; ``handle_message`` calls it
+        again for every platform. The gateway hook is idempotent, so the second
+        pass is a no-op while preserving one ordering contract everywhere.
+        """
         coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
@@ -3991,10 +4008,7 @@ class BasePlatformAdapter(ABC):
         event = self._apply_group_reply_session_mode(event)
 
         # Gateway-level pre-dispatch hooks (notably native profile routing)
-        # must run before this adapter computes its active-session key.  If the
-        # runner stamped source.profile only later, adapter guards would use
-        # agent:main while the runner used agent:<profile>, breaking busy
-        # queues, /stop, /approve, clarify replies, and post-delivery callbacks.
+        # must run before any active-session or batch key is computed.
         runner = getattr(self._message_handler, "__self__", None)
         pre_dispatch = getattr(runner, "_apply_pre_gateway_dispatch_hook", None)
         if callable(pre_dispatch):
@@ -4005,10 +4019,25 @@ class BasePlatformAdapter(ABC):
                 )
                 if isinstance(hook_result, tuple) and len(hook_result) >= 4:
                     event = hook_result[0]
-                    if bool(hook_result[2]):
-                        return
+                    return event, bool(hook_result[2])
             except Exception as e:
                 logger.warning("[%s] pre_gateway_dispatch early hook failed: %s", self.name, e)
+        return event, False
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """
+        Process an incoming message.
+
+        This method returns quickly by spawning background tasks.
+        This allows new messages to be processed even while an agent is running,
+        enabling interruption support.
+        """
+        if not self._message_handler:
+            return
+
+        event, pre_dispatch_skip = self._prepare_event_for_session_key(event)
+        if pre_dispatch_skip:
+            return
 
         session_key = build_session_key(
             event.source,
@@ -4074,6 +4103,7 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
+                        self._record_outbound_message_anchor(event, _r)
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -4124,6 +4154,7 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
+                            self._record_outbound_message_anchor(event, _r)
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
@@ -4225,20 +4256,7 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
-                _msg_id = getattr(result, "message_id", None)
-                _anchor_id = getattr(getattr(event, "source", None), "session_anchor_id", None)
-                _source = getattr(event, "source", None)
-                if _msg_id and _anchor_id and _source is not None:
-                    try:
-                        record_group_message_anchor(
-                            platform=_source.platform,
-                            chat_type=_source.chat_type,
-                            chat_id=_source.chat_id,
-                            message_id=str(_msg_id),
-                            anchor_id=str(_anchor_id),
-                        )
-                    except Exception:
-                        logger.debug("[%s] Failed to record outbound group message anchor", self.name, exc_info=True)
+                self._record_outbound_message_anchor(event, result)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).

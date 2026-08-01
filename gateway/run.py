@@ -7484,6 +7484,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Persist Feishu inbound reply anchors only after authorization.  The
+        # adapter's pre-batching normalizer is intentionally read-only so an
+        # unauthorized DM cannot grow the durable anchor store.
+        if (
+            not is_internal
+            and source.platform == Platform.FEISHU
+            and source.chat_type in {"dm", "group"}
+            and source.session_anchor_id
+        ):
+            inbound_message_ids = list(
+                getattr(event, "_session_anchor_message_ids", None) or []
+            )
+            latest_message_id = event.message_id or source.message_id
+            if latest_message_id:
+                inbound_message_ids.append(str(latest_message_id))
+            seen_inbound_ids: set[str] = set()
+            for inbound_message_id in inbound_message_ids:
+                inbound_message_id = str(inbound_message_id or "").strip()
+                if not inbound_message_id or inbound_message_id in seen_inbound_ids:
+                    continue
+                seen_inbound_ids.add(inbound_message_id)
+                try:
+                    from gateway.group_reply_session_mode import record_group_message_anchor
+
+                    record_group_message_anchor(
+                        platform=source.platform,
+                        chat_type=source.chat_type,
+                        chat_id=source.chat_id,
+                        message_id=inbound_message_id,
+                        anchor_id=str(source.session_anchor_id),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist authorized Feishu inbound anchor",
+                        exc_info=True,
+                    )
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
