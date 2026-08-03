@@ -1032,6 +1032,10 @@ DEFAULT_CONFIG = {
         "max_event_file_bytes": 5_000_000,
         "advisory_enabled": False,
         "max_advisory_file_bytes": 65_536,
+        "advisory_transition_log_enabled": False,
+        "max_advisory_transition_record_bytes": 65_536,
+        "max_advisory_transition_total_bytes": 8_000_000,
+        "max_advisory_transition_records": 1_024,
     },
     
     "terminal": {

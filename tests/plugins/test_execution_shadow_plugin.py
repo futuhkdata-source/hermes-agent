@@ -88,7 +88,7 @@ class TestManifestAndDiscovery:
         assert PLUGIN_INIT.is_file()
         manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
         assert manifest["name"] == "execution-shadow"
-        assert manifest["version"] == "0.2.0"
+        assert manifest["version"] == "0.3.0"
         assert manifest["kind"] == "standalone"
         assert set(manifest["hooks"]) == {
             "pre_llm_call",
@@ -151,6 +151,10 @@ def test_default_config_is_disabled_shadow_mode():
         "max_event_file_bytes": 5_000_000,
         "advisory_enabled": False,
         "max_advisory_file_bytes": 65_536,
+        "advisory_transition_log_enabled": False,
+        "max_advisory_transition_record_bytes": 65_536,
+        "max_advisory_transition_total_bytes": 8_000_000,
+        "max_advisory_transition_records": 1_024,
     }
 
 

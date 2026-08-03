@@ -14,12 +14,21 @@ import json
 import logging
 import os
 import re
+import secrets
+import stat as stat_module
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback uses process lock only
+    fcntl = None  # type: ignore[assignment]
 
 import yaml
 
@@ -56,6 +65,10 @@ class Settings:
     max_event_file_bytes: int = 5_000_000
     advisory_enabled: bool = False
     max_advisory_file_bytes: int = 65_536
+    advisory_transition_log_enabled: bool = False
+    max_advisory_transition_record_bytes: int = 65_536
+    max_advisory_transition_total_bytes: int = 8_000_000
+    max_advisory_transition_records: int = 1_024
 
 
 @dataclass
@@ -97,6 +110,10 @@ class TurnState:
     warnings: set[str] = field(default_factory=set)
     created_at: str = field(default_factory=lambda: _utc_now())
     updated_at: str = field(default_factory=lambda: _utc_now())
+    last_advisory_signature: tuple[
+        str, tuple[str, ...], tuple[str, ...], str
+    ] | None = field(default=None, repr=False)
+    last_advisory_primary_action: str | None = field(default=None, repr=False)
 
 
 def _utc_now() -> str:
@@ -158,6 +175,38 @@ def _load_settings(home: Path) -> Settings:
                     4_096,
                     _as_nonnegative_int(
                         section.get("max_advisory_file_bytes"), 65_536
+                    ),
+                ),
+            ),
+            advisory_transition_log_enabled=_as_bool(
+                section.get("advisory_transition_log_enabled"), False
+            ),
+            max_advisory_transition_record_bytes=min(
+                1_000_000,
+                max(
+                    4_096,
+                    _as_nonnegative_int(
+                        section.get("max_advisory_transition_record_bytes"),
+                        65_536,
+                    ),
+                ),
+            ),
+            max_advisory_transition_total_bytes=min(
+                100_000_000,
+                max(
+                    64_000,
+                    _as_nonnegative_int(
+                        section.get("max_advisory_transition_total_bytes"),
+                        8_000_000,
+                    ),
+                ),
+            ),
+            max_advisory_transition_records=min(
+                4_096,
+                max(
+                    1,
+                    _as_nonnegative_int(
+                        section.get("max_advisory_transition_records"), 1_024
                     ),
                 ),
             ),
@@ -353,6 +402,373 @@ def _atomic_write_json(
             pass
 
 
+def _decision_signature(
+    advisory: dict[str, Any],
+) -> tuple[str, tuple[str, ...], tuple[str, ...], str]:
+    primary_action = advisory.get("primary_action")
+    actions = advisory.get("actions")
+    reason_codes = advisory.get("reason_codes")
+    urgency = advisory.get("urgency")
+    if not isinstance(primary_action, str) or not primary_action:
+        raise ValueError("invalid transition primary action")
+    if not isinstance(actions, list) or not all(
+        isinstance(item, str) and 0 < len(item) <= 64 for item in actions
+    ):
+        raise ValueError("invalid transition actions")
+    if not isinstance(reason_codes, list) or not all(
+        isinstance(item, str) and 0 < len(item) <= 128 for item in reason_codes
+    ):
+        raise ValueError("invalid transition reason codes")
+    if len(actions) > 16 or len(reason_codes) > 32:
+        raise ValueError("transition decision vector exceeds item cap")
+    if not isinstance(urgency, str) or urgency not in {"none", "low", "medium", "high"}:
+        raise ValueError("invalid transition urgency")
+    return primary_action, tuple(actions), tuple(reason_codes), urgency
+
+
+def _decision_digest(
+    signature: tuple[str, tuple[str, ...], tuple[str, ...], str],
+) -> str:
+    primary_action, actions, reason_codes, urgency = signature
+    canonical = json.dumps(
+        {
+            "actions": list(actions),
+            "primary_action": primary_action,
+            "reason_codes": list(reason_codes),
+            "urgency": urgency,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()[:24]
+
+
+def _advisory_transition_record(
+    state: TurnState,
+    source_payload: dict[str, Any],
+    advisory: dict[str, Any],
+    signature: tuple[str, tuple[str, ...], tuple[str, ...], str],
+) -> dict[str, Any]:
+    observed = advisory.get("observed")
+    if not isinstance(observed, dict):
+        raise ValueError("invalid transition observations")
+    primary_action, actions, reason_codes, urgency = signature
+    return {
+        "schema_version": "hermes.execution-advisory-transition.v1",
+        "mode": "advisory-transition",
+        "source_schema_version": advisory.get("source_schema_version"),
+        "timestamp": source_payload.get("updated_at"),
+        "turn_digest": advisory.get("turn_digest"),
+        "decision_digest": _decision_digest(signature),
+        "previous_primary_action": state.last_advisory_primary_action,
+        "primary_action": primary_action,
+        "actions": list(actions),
+        "reason_codes": list(reason_codes),
+        "urgency": urgency,
+        "observed": dict(observed),
+        "control_effects": dict(advisory["control_effects"]),
+    }
+
+
+def _utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def _transition_record_name(record: dict[str, Any]) -> str:
+    return (
+        f"transition-{_utc_day()}-{time.time_ns()}-"
+        f"{record['decision_digest']}-{secrets.token_hex(8)}.json"
+    )
+
+
+def _open_advisory_transition_directory(root: Path) -> int:
+    flags = os.O_RDONLY
+    for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+        flags |= getattr(os, flag_name, 0)
+    root_fd = os.open(root, flags)
+    try:
+        try:
+            os.mkdir("advisory-transitions", 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(
+            "advisory-transitions",
+            flags,
+            dir_fd=root_fd,
+        )
+    finally:
+        os.close(root_fd)
+    opened = os.fstat(directory_fd)
+    if not stat_module.S_ISDIR(opened.st_mode):
+        os.close(directory_fd)
+        raise OSError("unsafe advisory transition directory type")
+    if os.name != "nt":
+        os.fchmod(directory_fd, 0o700)
+    return directory_fd
+
+
+@contextmanager
+def _advisory_transition_lock(directory_fd: int):
+    flags = os.O_RDWR | os.O_CREAT
+    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW"):
+        flags |= getattr(os, flag_name, 0)
+    lock_fd = os.open(".transition.lock", flags, 0o600, dir_fd=directory_fd)
+    try:
+        opened = os.fstat(lock_fd)
+        path_info = os.stat(
+            ".transition.lock",
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if not (
+            stat_module.S_ISREG(opened.st_mode)
+            and opened.st_nlink == 1
+            and (opened.st_dev, opened.st_ino) == (path_info.st_dev, path_info.st_ino)
+        ):
+            raise OSError("unsafe advisory transition lock file")
+        if os.name != "nt":
+            os.fchmod(lock_fd, 0o600)
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def _write_transition_bytes(fd: int, encoded: bytes) -> None:
+    remaining = memoryview(encoded)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("advisory transition write made no progress")
+        remaining = remaining[written:]
+
+
+def _sync_transition_file(fd: int) -> None:
+    os.fsync(fd)
+
+
+def _sync_transition_directory(fd: int) -> None:
+    os.fsync(fd)
+
+
+def _close_transition_file(fd: int) -> None:
+    os.close(fd)
+
+
+def _open_transition_temp(directory_fd: int) -> tuple[str, int]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, flag_name, 0)
+    for _attempt in range(32):
+        name = f".transition-tmp-{secrets.token_hex(16)}"
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        opened = os.fstat(fd)
+        if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            os.close(fd)
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError:
+                pass
+            raise OSError("unsafe advisory transition temporary file")
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        return name, fd
+    raise OSError("unable to reserve advisory transition temporary file")
+
+
+def _transition_record_entries(
+    directory_fd: int,
+) -> list[tuple[int, str, int]]:
+    entries: list[tuple[int, str, int]] = []
+    pattern = re.compile(r"^transition-\d{8}-\d+-[0-9a-f]{24}-[0-9a-f]+\.json$")
+    scanned = 0
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            scanned += 1
+            if scanned > 16_384:
+                raise OSError("advisory transition directory scan cap exceeded")
+            if pattern.fullmatch(entry.name) is None:
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat_module.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                entries.append((info.st_mtime_ns, entry.name, info.st_size))
+    return entries
+
+
+def _prune_advisory_transition_records(
+    directory_fd: int,
+    settings: Settings,
+    *,
+    protected_name: str,
+) -> None:
+    entries = _transition_record_entries(directory_fd)
+    entries.sort(key=lambda item: (item[0], item[1]))
+    count = len(entries)
+    total_bytes = sum(item[2] for item in entries)
+    removed = False
+    for _mtime, name, size in entries:
+        if (
+            count <= settings.max_advisory_transition_records
+            and total_bytes <= settings.max_advisory_transition_total_bytes
+        ):
+            break
+        if name == protected_name:
+            continue
+        os.unlink(name, dir_fd=directory_fd)
+        count -= 1
+        total_bytes -= size
+        removed = True
+    if (
+        count > settings.max_advisory_transition_records
+        or total_bytes > settings.max_advisory_transition_total_bytes
+    ):
+        raise OSError("advisory transition retention bounds cannot be satisfied")
+    if removed:
+        _sync_transition_directory(directory_fd)
+
+
+def _publish_transition_record(
+    directory_fd: int,
+    settings: Settings,
+    record: dict[str, Any],
+    encoded: bytes,
+) -> bool:
+    temp_name: str | None = None
+    temp_fd: int | None = None
+    final_name: str | None = None
+    directory_synced = False
+    try:
+        temp_name, temp_fd = _open_transition_temp(directory_fd)
+        _write_transition_bytes(temp_fd, encoded)
+        _sync_transition_file(temp_fd)
+        try:
+            _close_transition_file(temp_fd)
+        except Exception:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+            temp_fd = None
+            raise
+        temp_fd = None
+
+        for _attempt in range(32):
+            candidate = _transition_record_name(record)
+            try:
+                os.link(
+                    temp_name,
+                    candidate,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                continue
+            final_name = candidate
+            break
+        if final_name is None:
+            raise OSError("unable to reserve advisory transition record name")
+
+        os.unlink(temp_name, dir_fd=directory_fd)
+        temp_name = None
+        published = os.stat(
+            final_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if not stat_module.S_ISREG(published.st_mode) or published.st_nlink != 1:
+            raise OSError("unsafe published advisory transition record")
+        try:
+            _sync_transition_directory(directory_fd)
+        except Exception:
+            os.unlink(final_name, dir_fd=directory_fd)
+            final_name = None
+            try:
+                _sync_transition_directory(directory_fd)
+            except OSError:
+                pass
+            raise
+        directory_synced = True
+
+        try:
+            _prune_advisory_transition_records(
+                directory_fd,
+                settings,
+                protected_name=final_name,
+            )
+        except OSError:
+            logger.debug(
+                "execution-shadow transition retention pruning failed open",
+                exc_info=True,
+            )
+        return True
+    finally:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        if final_name is not None and not directory_synced:
+            try:
+                os.unlink(final_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+
+
+def _store_advisory_transition(
+    state: TurnState,
+    settings: Settings,
+    record: dict[str, Any],
+) -> bool:
+    encoded = (
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    record_cap = min(
+        settings.max_advisory_file_bytes,
+        settings.max_advisory_transition_record_bytes,
+        settings.max_advisory_transition_total_bytes,
+    )
+    if len(encoded) > record_cap:
+        return False
+
+    directory_fd = _open_advisory_transition_directory(_telemetry_root(state))
+    try:
+        with _advisory_transition_lock(directory_fd):
+            return _publish_transition_record(
+                directory_fd,
+                settings,
+                record,
+                encoded,
+            )
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
 def _persist_advisory(
     state: TurnState,
     settings: Settings,
@@ -379,12 +795,33 @@ def _persist_advisory(
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{24}", digest) is None:
             raise ValueError("invalid advisory digest")
         path = _telemetry_root(state) / "advisories" / f"{digest}.json"
-        if not _atomic_write_json(
+        written = _atomic_write_json(
             path,
             advisory,
             max_bytes=settings.max_advisory_file_bytes,
-        ):
-            logger.warning("execution-shadow advisory skipped: serialized result exceeds byte cap")
+        )
+        if not written:
+            logger.warning(
+                "execution-shadow advisory skipped: serialized result exceeds byte cap"
+            )
+            return None
+        if settings.advisory_transition_log_enabled:
+            signature = _decision_signature(advisory)
+            if signature != state.last_advisory_signature:
+                record = _advisory_transition_record(
+                    state,
+                    source_payload,
+                    advisory,
+                    signature,
+                )
+                if _store_advisory_transition(state, settings, record):
+                    state.last_advisory_signature = signature
+                    state.last_advisory_primary_action = advisory["primary_action"]
+                else:
+                    logger.warning(
+                        "execution-shadow advisory transition skipped: "
+                        "serialized record exceeds byte cap"
+                    )
     except Exception:
         logger.debug("execution-shadow advisory failed open", exc_info=True)
     return None

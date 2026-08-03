@@ -1,6 +1,6 @@
 # P1-C Live Shadow Advisory Activation
 
-**Status:** default-off candidate implemented; independent review and production cutover pending.
+**Status:** live shadow advisory activated with `GO_P1C_LIVE_SHADOW` on 2026-08-04 HKT; source commit `8f2d969f7c5b35e322e90912df6c17b204a0909e`.
 
 ## Purpose
 
@@ -61,10 +61,17 @@ Sidecars may contain only finite action/reason codes, urgency, bounded numeric/b
 10. Verify a valid sidecar, unchanged response path, permissions, no leakage, and stable Gateway health.
 11. On any failure, restore the config backup (or force advisory false), verify health, and issue `NO-GO`.
 
+## Live activation evidence
+
+- Final cutover verdict: `GO_P1C_LIVE_SHADOW`.
+- Evidence: `/home/ubuntu/.hermes/backups/p1c-live-shadow-cutover-20260804-023929-HKT/cutover-retry-result.json`.
+- The first canary harness attempt received HTTP 401 and restored the config exactly; the bounded retry loaded the owner-only profile credential, proved dark-load zero-sidecar behavior, then activated the advisory gate and verified valid private sidecars.
+- Gateway, Feishu, and API Server remained connected; orchestration and Kanban dispatch remained disabled.
+
 ## Explicitly out of scope
 
 - Advice display or prompt/context injection.
 - Automated action or enforcement.
 - New hooks, tools, routes, workers, schedulers, cron business logic, orchestration, Kanban, or durable claims.
-- Advisory transition history or external delivery.
+- Advisory transition history within P1-C itself; a separate default-off P1-C.1 contract governs that capability.
 - Remote push/PR unless separately approved.
