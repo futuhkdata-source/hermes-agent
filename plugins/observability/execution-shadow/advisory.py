@@ -1,8 +1,8 @@
-"""Offline-only P1-B advisory evaluation for execution-shadow snapshots.
+"""Pure advisory evaluation for execution-shadow snapshots.
 
-This module is intentionally not imported by the live execution-shadow plugin.
-It accepts metadata-only P1-A snapshots and returns deterministic advice.  It
-cannot block, stop, rewrite, route, schedule, or spawn anything.
+The evaluator is used by deterministic offline replay and, only behind the
+profile-scoped Stage C config gate, by the live shadow plugin to write local
+sidecars. It cannot block, stop, rewrite, route, schedule, or spawn anything.
 """
 from __future__ import annotations
 

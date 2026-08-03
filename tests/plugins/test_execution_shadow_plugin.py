@@ -24,7 +24,11 @@ PLUGIN_KEY = "observability/execution-shadow"
 def _load_plugin():
     name = "execution_shadow_plugin_under_test"
     sys.modules.pop(name, None)
-    spec = importlib.util.spec_from_file_location(name, PLUGIN_INIT)
+    spec = importlib.util.spec_from_file_location(
+        name,
+        PLUGIN_INIT,
+        submodule_search_locations=[str(PLUGIN_DIR)],
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -84,6 +88,7 @@ class TestManifestAndDiscovery:
         assert PLUGIN_INIT.is_file()
         manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
         assert manifest["name"] == "execution-shadow"
+        assert manifest["version"] == "0.2.0"
         assert manifest["kind"] == "standalone"
         assert set(manifest["hooks"]) == {
             "pre_llm_call",
@@ -144,6 +149,8 @@ def test_default_config_is_disabled_shadow_mode():
         "max_reviewers": 1,
         "max_remediations": 1,
         "max_event_file_bytes": 5_000_000,
+        "advisory_enabled": False,
+        "max_advisory_file_bytes": 65_536,
     }
 
 

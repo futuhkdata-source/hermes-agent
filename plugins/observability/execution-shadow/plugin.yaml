@@ -1,6 +1,6 @@
 name: execution-shadow
-version: "0.1.0"
-description: "Local, profile-scoped shadow telemetry for execution phase, budget gates, helper/review counts, completion evidence, and closure-contract warnings. Never changes control flow."
+version: "0.2.0"
+description: "Local, profile-scoped execution-shadow telemetry with an optional default-off advisory sidecar. Never changes control flow."
 author: NousResearch / Hermes
 kind: standalone
 hooks:

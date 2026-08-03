@@ -1019,6 +1019,8 @@ DEFAULT_CONFIG = {
     # Optional local execution-lifecycle observer. Disabled by default and
     # strictly shadow-only: it records phase/budget/completion signals through
     # existing plugin hooks but never blocks, rewrites, or schedules work.
+    # The nested advisory gate is independently default-off and only writes
+    # bounded local sidecars; it never injects advice into model context.
     "execution_shadow": {
         "enabled": False,
         "mode": "shadow",
@@ -1028,6 +1030,8 @@ DEFAULT_CONFIG = {
         "max_reviewers": 1,
         "max_remediations": 1,
         "max_event_file_bytes": 5_000_000,
+        "advisory_enabled": False,
+        "max_advisory_file_bytes": 65_536,
     },
     
     "terminal": {

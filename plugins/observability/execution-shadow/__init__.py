@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from typing import Any, Callable
 import yaml
 
 from hermes_constants import get_hermes_home
+
+from .advisory import evaluate_snapshot
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,8 @@ class Settings:
     max_reviewers: int = 1
     max_remediations: int = 1
     max_event_file_bytes: int = 5_000_000
+    advisory_enabled: bool = False
+    max_advisory_file_bytes: int = 65_536
 
 
 @dataclass
@@ -145,6 +150,16 @@ def _load_settings(home: Path) -> Settings:
             max_event_file_bytes=max(
                 64_000,
                 _as_nonnegative_int(section.get("max_event_file_bytes"), 5_000_000),
+            ),
+            advisory_enabled=_as_bool(section.get("advisory_enabled"), False),
+            max_advisory_file_bytes=min(
+                1_000_000,
+                max(
+                    4_096,
+                    _as_nonnegative_int(
+                        section.get("max_advisory_file_bytes"), 65_536
+                    ),
+                ),
             ),
         )
     except Exception:
@@ -302,19 +317,77 @@ def _ensure_private_dir(path: Path) -> None:
         path.chmod(0o700)
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    max_bytes: int | None = None,
+) -> bool:
     _ensure_private_dir(path.parent)
-    tmp = path.parent / (
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    if max_bytes is not None and len(encoded) > max_bytes:
+        return False
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
     )
-    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    with tmp.open("w", encoding="utf-8") as handle:
-        handle.write(data)
-    if os.name != "nt":
-        tmp.chmod(0o600)
-    os.replace(tmp, path)
-    if os.name != "nt":
-        path.chmod(0o600)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        if os.name != "nt":
+            tmp.chmod(0o600)
+        os.replace(tmp, path)
+        if os.name != "nt":
+            path.chmod(0o600)
+        return True
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _persist_advisory(
+    state: TurnState,
+    settings: Settings,
+    source_payload: dict[str, Any],
+) -> None:
+    if not settings.advisory_enabled:
+        return None
+    try:
+        advisory = evaluate_snapshot(source_payload)
+        if advisory.get("schema_version") != "hermes.execution-advisory.v1":
+            raise ValueError("unexpected advisory schema")
+        if advisory.get("mode") != "advisory":
+            raise ValueError("unexpected advisory mode")
+        if advisory.get("control_effects") != {
+            "block": False,
+            "rewrite": False,
+            "route": False,
+            "schedule": False,
+            "spawn": False,
+            "stop": False,
+        }:
+            raise ValueError("advisory control boundary violated")
+        digest = advisory.get("turn_digest")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{24}", digest) is None:
+            raise ValueError("invalid advisory digest")
+        path = _telemetry_root(state) / "advisories" / f"{digest}.json"
+        if not _atomic_write_json(
+            path,
+            advisory,
+            max_bytes=settings.max_advisory_file_bytes,
+        ):
+            logger.warning("execution-shadow advisory skipped: serialized result exceeds byte cap")
+    except Exception:
+        logger.debug("execution-shadow advisory failed open", exc_info=True)
+    return None
 
 
 def _event_file(root: Path) -> Path:
@@ -373,6 +446,7 @@ def _persist_state(state: TurnState, settings: Settings, event: str) -> None:
     payload = _state_payload(state, settings)
     _atomic_write_json(_snapshot_path(state), payload)
     _append_event(state, settings, event)
+    _persist_advisory(state, settings, payload)
 
 
 def _safe_update(
