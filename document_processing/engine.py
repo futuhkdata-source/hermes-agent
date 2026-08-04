@@ -22,6 +22,8 @@ from gateway.attachment_provenance import (
 )
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
+from .concurrency import DocumentConcurrencyError, paddle_slot
+
 
 PADDLE_RUNNER = Path(__file__).resolve().with_name("paddle_runner.py")
 PYTHON_BIN = sys.executable
@@ -436,6 +438,23 @@ def _prepare_paddle_runtime(work: Path) -> dict[str, str]:
     }
 
 
+def _run_paddle_ocr(
+    image_path: Path,
+    work: Path,
+) -> tuple[subprocess.CompletedProcess[str], float]:
+    paddle_env = _prepare_paddle_runtime(work)
+    try:
+        with paddle_slot(_runtime_profile_name(), timeout=180.0) as waited:
+            result = _run(
+                [PYTHON_BIN, str(PADDLE_RUNNER), str(image_path)],
+                240,
+                paddle_env,
+            )
+    except DocumentConcurrencyError as exc:
+        raise DocumentExtractError(str(exc)) from None
+    return result, float(waited)
+
+
 def _validate_generated_image(value: Any, artifact: SourceArtifact) -> Path:
     work = _source_workdir(artifact)
     raw = Path(str(value or "")).expanduser()
@@ -765,6 +784,161 @@ def _sanitize_paddle_items(value: Any) -> list[dict[str, Any]]:
     return items
 
 
+def _internal_document_call(session_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(handle_document_extract(args, session_id=session_id))
+    except json.JSONDecodeError:
+        raise DocumentExtractError("Internal document action returned invalid JSON") from None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        message = str(payload.get("error") if isinstance(payload, dict) else "")
+        raise DocumentExtractError(message or "Internal document action failed safely")
+    return payload
+
+
+def _usable_text_layer(value: Any) -> bool:
+    text = str(value or "")
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 12:
+        return False
+    printable = sum(1 for character in text if character.isprintable() or character in "\n\r\t")
+    return printable / max(1, len(text)) >= 0.9
+
+
+def _normalized_ocr_confidence(payload: dict[str, Any], engine: str) -> float | None:
+    raw = payload.get("average_confidence")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if engine == "paddle":
+        value *= 100.0
+    return max(0.0, min(100.0, value))
+
+
+def _ocr_candidate_quality(payload: dict[str, Any], engine: str) -> float:
+    confidence = _normalized_ocr_confidence(payload, engine)
+    text_chars = len(re.sub(r"\s+", "", str(payload.get("text") or "")))
+    try:
+        low_count = max(0, int(payload.get("low_confidence_count") or 0))
+    except (TypeError, ValueError):
+        low_count = 0
+    return (confidence if confidence is not None else -20.0) + min(10.0, text_chars / 50.0) - min(20, low_count)
+
+
+def _bounded_extract_text(value: Any) -> tuple[str, bool]:
+    text = str(value or "")
+    limit = 20_000
+    return (text, False) if len(text) <= limit else (text[:limit], True)
+
+
+def _extract_page_auto(
+    session_id: str,
+    *,
+    page: int,
+    dpi: int,
+    paddle_allowed: bool,
+) -> dict[str, Any]:
+    text_layer = _internal_document_call(session_id, {
+        "action": "text_layer", "first_page": page, "last_page": page,
+    })
+    if _usable_text_layer(text_layer.get("text")):
+        text, truncated = _bounded_extract_text(text_layer.get("text"))
+        return {
+            "page": page,
+            "method": "text_layer",
+            "text": text,
+            "text_chars": len(str(text_layer.get("text") or "")),
+            "text_truncated": truncated or bool(text_layer.get("truncated")),
+            "average_confidence": None,
+            "low_confidence_count": 0,
+            "needs_vision_review": False,
+            "paddle_used": False,
+        }
+
+    rendered = _internal_document_call(session_id, {
+        "action": "render_pages",
+        "first_page": page,
+        "last_page": page,
+        "dpi": dpi,
+    })
+    rendered_pages = rendered.get("pages")
+    if not isinstance(rendered_pages, list) or len(rendered_pages) != 1:
+        raise DocumentExtractError("Adaptive render did not return exactly one page")
+    evidence = rendered_pages[0]
+    if not isinstance(evidence, dict):
+        raise DocumentExtractError("Adaptive render evidence is malformed")
+    ocr_image = str(evidence.get("ocr_image") or "")
+    vision_image = str(evidence.get("vision_image") or "")
+    if not ocr_image or not vision_image:
+        raise DocumentExtractError("Adaptive render did not return evidence images")
+
+    tesseract = _internal_document_call(session_id, {
+        "action": "ocr_image",
+        "image_path": ocr_image,
+        "engine": "tesseract",
+        "psm": 11,
+    })
+    candidates: list[tuple[str, dict[str, Any]]] = [("tesseract", tesseract)]
+    tesseract_confidence = _normalized_ocr_confidence(tesseract, "tesseract")
+    tesseract_text_chars = len(re.sub(r"\s+", "", str(tesseract.get("text") or "")))
+    try:
+        tesseract_low = int(tesseract.get("low_confidence_count") or 0)
+    except (TypeError, ValueError):
+        tesseract_low = 0
+    weak_tesseract = (
+        tesseract_confidence is None
+        or tesseract_confidence < 80.0
+        or tesseract_low > 0
+        or tesseract_text_chars < 12
+    )
+
+    paddle_used = False
+    if paddle_allowed and weak_tesseract:
+        paddle = _internal_document_call(session_id, {
+            "action": "ocr_image",
+            "image_path": ocr_image,
+            "engine": "paddle",
+        })
+        candidates.append(("paddle", paddle))
+        paddle_used = True
+
+    selected_engine, selected = max(
+        candidates,
+        key=lambda candidate: _ocr_candidate_quality(candidate[1], candidate[0]),
+    )
+    confidence = _normalized_ocr_confidence(selected, selected_engine)
+    try:
+        low_count = max(0, int(selected.get("low_confidence_count") or 0))
+    except (TypeError, ValueError):
+        low_count = 0
+    selected_text_raw = str(selected.get("text") or "")
+    selected_compact_chars = len(re.sub(r"\s+", "", selected_text_raw))
+    text, truncated = _bounded_extract_text(selected_text_raw)
+    needs_review = (
+        confidence is None
+        or confidence < 85.0
+        or low_count > 0
+        or selected_compact_chars < 12
+    )
+    return {
+        "page": page,
+        "method": selected_engine,
+        "text": text,
+        "text_chars": len(selected_text_raw),
+        "text_truncated": truncated or bool(selected.get("text_truncated")),
+        "average_confidence": round(confidence, 3) if confidence is not None else None,
+        "low_confidence_count": low_count,
+        "needs_vision_review": needs_review,
+        "paddle_used": paddle_used,
+        "vision_image": vision_image,
+        "ocr_image": ocr_image,
+        "rotation_degrees": evidence.get("rotation_degrees"),
+        "deskew_degrees": evidence.get("deskew_degrees"),
+    }
+
+
 def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
     try:
         session_id = str(kwargs.get("session_id") or "").strip()
@@ -792,6 +966,68 @@ def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
 
         if metadata["encrypted"]:
             raise DocumentExtractError("Encrypted PDFs are not supported")
+
+        if action == "extract":
+            try:
+                first_raw = args.get("first_page", 1)
+                first = int(first_raw)
+                last_value = args.get("last_page")
+                last = (
+                    int(last_value)
+                    if last_value is not None
+                    else min(int(metadata["pages"]), first + _MAX_PAGES_PER_CALL - 1)
+                )
+                dpi = int(args.get("dpi", 300))
+                max_paddle_pages = int(args.get("max_paddle_pages", 1))
+            except (TypeError, ValueError):
+                raise DocumentExtractError(
+                    "extract page, dpi and max_paddle_pages values must be integers"
+                ) from None
+            first, last = _validate_pages(first, last, int(metadata["pages"]))
+            if not 150 <= dpi <= 300:
+                raise DocumentExtractError("dpi must be within 150-300")
+            if not 0 <= max_paddle_pages <= 2:
+                raise DocumentExtractError("max_paddle_pages must be within 0-2")
+
+            extracted_pages: list[dict[str, Any]] = []
+            paddle_pages_used = 0
+            for page in range(first, last + 1):
+                page_result = _extract_page_auto(
+                    session_id,
+                    page=page,
+                    dpi=dpi,
+                    paddle_allowed=paddle_pages_used < max_paddle_pages,
+                )
+                if bool(page_result.get("paddle_used")):
+                    paddle_pages_used += 1
+                extracted_pages.append(page_result)
+
+            combined_raw = "\n\n".join(
+                f"[Page {page['page']}]\n{page.get('text') or ''}"
+                for page in extracted_pages
+            )
+            combined, combined_truncated = _bounded_text(combined_raw)
+            review_pages = [
+                int(page["page"])
+                for page in extracted_pages
+                if bool(page.get("needs_vision_review"))
+            ]
+            has_more = last < int(metadata["pages"])
+            return _success(
+                **source_evidence,
+                first_page=first,
+                last_page=last,
+                total_pages=int(metadata["pages"]),
+                has_more=has_more,
+                next_page=last + 1 if has_more else None,
+                dpi=dpi,
+                paddle_pages_used=paddle_pages_used,
+                review_pages=review_pages,
+                pages=extracted_pages,
+                text=combined,
+                text_chars=len(combined_raw),
+                text_truncated=combined_truncated,
+            )
 
         if action == "text_layer":
             first, last = _validate_pages(args.get("first_page"), args.get("last_page"), metadata["pages"])
@@ -977,6 +1213,7 @@ def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
                 )
 
             engine = str(args.get("engine") or "tesseract").strip().lower()
+            queue_wait_seconds = 0.0
             if engine == "tesseract":
                 try:
                     psm = int(args.get("psm", 11))
@@ -991,12 +1228,7 @@ def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
                 items = _parse_tesseract_tsv(result.stdout)
                 summary = _summarize_ocr_items(items, 70.0)
             elif engine == "paddle":
-                paddle_env = _prepare_paddle_runtime(work)
-                result = _run(
-                    [PYTHON_BIN, str(PADDLE_RUNNER), str(image_path)],
-                    240,
-                    paddle_env,
-                )
+                result, queue_wait_seconds = _run_paddle_ocr(image_path, work)
                 try:
                     payload = json.loads(result.stdout)
                 except json.JSONDecodeError:
@@ -1009,7 +1241,8 @@ def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
                 raise DocumentExtractError("engine must be tesseract or paddle")
             return _success(
                 **source_evidence, page=page, engine=engine,
-                source_image=str(image_path), items=items, **summary,
+                source_image=str(image_path), items=items,
+                queue_wait_seconds=round(queue_wait_seconds, 3), **summary,
             )
 
         if action == "cleanup":
@@ -1024,7 +1257,7 @@ def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
             return _success(**source_evidence, removed_files=removed_files)
 
         raise DocumentExtractError(
-            "Unknown action; use metadata, text_layer, render_pages, detect_regions, "
+            "Unknown action; use extract, metadata, text_layer, render_pages, detect_regions, "
             "tile_image, crop_image, ocr_image, or cleanup"
         )
     except DocumentExtractError as exc:

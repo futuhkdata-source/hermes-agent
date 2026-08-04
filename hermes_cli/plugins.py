@@ -233,7 +233,9 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_KINDS: Set[str] = {
+    "standalone", "backend", "capability", "exclusive", "platform", "model-provider",
+}
 
 
 @dataclass
@@ -255,6 +257,9 @@ class PluginManifest:
     # ``backend``: pluggable backend for an existing core tool (e.g.
     #              image_gen). Built-in (bundled) backends auto-load;
     #              user-installed still gated by ``plugins.enabled``.
+    # ``capability``: bounded, service-gated model capability. Bundled
+    #              capability plugins auto-load; user-installed variants
+    #              remain opt-in. Explicit ``plugins.disabled`` always wins.
     # ``exclusive``: category with exactly one active provider (memory).
     #              Selection via ``<category>.provider`` config key; the
     #              category's own discovery system handles loading and the
@@ -1276,14 +1281,17 @@ class PluginManager:
             # services calls) is driven by ``<category>.provider`` config,
             # enforced by the tool wrapper.
             #
-            # Bundled platform plugins (gateway adapters like IRC) auto-load
-            # for the same reason: every platform Hermes ships must be
-            # available out of the box without the user having to opt in.
-            if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
+            # Bundled platform plugins (gateway adapters like IRC) and bounded
+            # capability plugins auto-load for the same reason: shipped
+            # functionality should be available without per-profile plugin
+            # copies. Tool ``check_fn`` gates unavailable local services.
+            if manifest.source == "bundled" and manifest.kind in {
+                "backend", "capability", "platform",
+            }:
                 self._load_plugin(manifest)
                 continue
 
-            # Everything else (standalone, user-installed backends,
+            # Everything else (standalone, user-installed backends/capabilities,
             # entry-point plugins) is opt-in via plugins.enabled.
             # Accept both the path-derived key and the legacy bare name
             # so existing configs keep working.

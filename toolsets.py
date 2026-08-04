@@ -38,8 +38,8 @@ _HERMES_CORE_TOOLS = [
     "read_terminal",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
-    # Vision + image generation
-    "vision_analyze", "image_generate",
+    # Vision + bounded document extraction + image generation
+    "vision_analyze", "document_extract", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -396,8 +396,8 @@ TOOLSETS = {
             "terminal", "process",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
-            # Vision + image generation
-            "vision_analyze", "image_generate",
+            # Vision + bounded document extraction + image generation
+            "vision_analyze", "document_extract", "image_generate",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation

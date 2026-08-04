@@ -1,8 +1,9 @@
 DOCUMENT_EXTRACT_SCHEMA = {
     "name": "document_extract",
     "description": (
-        "Safely inspect and OCR the latest PDF uploaded in the current Feishu session. "
-        "The runtime binds the source; never pass a source path. Always check metadata/text_layer first. "
+        "Safely extract the latest PDF uploaded in the current Feishu session. "
+        "The runtime binds the source; never pass a source path. Prefer extract for the adaptive "
+        "text-layer-first path; use expert actions only for targeted evidence work. "
         "For scanned pages, use render_pages (direct PDF rasterization with auto-rotation/deskew), then "
         "detect_regions or tile_image/crop_image before ocr_image on dense layouts. Generated image paths "
         "may also be passed to vision_analyze for blind verification. Never use a browser PDF viewer fallback."
@@ -13,13 +14,20 @@ DOCUMENT_EXTRACT_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": [
-                    "metadata", "text_layer", "render_pages", "detect_regions",
+                    "extract", "metadata", "text_layer", "render_pages", "detect_regions",
                     "tile_image", "crop_image", "ocr_image", "cleanup",
                 ],
             },
             "first_page": {"type": "integer", "minimum": 1, "maximum": 500},
             "last_page": {"type": "integer", "minimum": 1, "maximum": 500},
             "dpi": {"type": "integer", "minimum": 150, "maximum": 300, "default": 300},
+            "max_paddle_pages": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2,
+                "default": 1,
+                "description": "Maximum weak scan pages upgraded from Tesseract to local Paddle in one extract call.",
+            },
             "image_path": {
                 "type": "string",
                 "description": (

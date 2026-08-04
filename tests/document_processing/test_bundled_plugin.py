@@ -33,7 +33,7 @@ def test_bundled_plugin_manifest_is_a_single_bounded_edge_tool():
     manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
 
     assert manifest["name"] == "document-extract"
-    assert manifest["kind"] == "standalone"
+    assert manifest["kind"] == "capability"
     assert manifest["provides_tools"] == ["document_extract"]
     assert not (PLUGIN_DIR / "engine.py").exists()
     assert not (PLUGIN_DIR / "paddle_runner.py").exists()
@@ -66,3 +66,59 @@ def test_plugin_registers_the_shared_engine_handler_and_schema():
     assert call["handler"] is handle_document_extract
     assert call["check_fn"] is check_requirements
     assert call["emoji"] == "📄"
+
+
+def test_bundled_capability_auto_loads_without_per_profile_enable(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager._plugins["document-extract"]
+    assert loaded.manifest.source == "bundled"
+    assert loaded.manifest.kind == "capability"
+    assert loaded.enabled is True
+    assert loaded.tools_registered == ["document_extract"]
+
+
+def test_explicit_disabled_config_blocks_bundled_capability(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "plugins:\n  disabled:\n    - document-extract\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager._plugins["document-extract"]
+    assert loaded.enabled is False
+    assert loaded.error == "disabled via config"
+
+
+def test_document_extract_is_shared_by_all_standard_platform_toolsets():
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+
+    assert "document_extract" in _HERMES_CORE_TOOLS
+    for platform in (
+        "hermes-cli",
+        "hermes-telegram",
+        "hermes-discord",
+        "hermes-whatsapp",
+        "hermes-slack",
+        "hermes-signal",
+        "hermes-homeassistant",
+        "hermes-api-server",
+        "hermes-feishu",
+    ):
+        assert "document_extract" in TOOLSETS[platform]["tools"]
