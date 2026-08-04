@@ -1233,7 +1233,20 @@ class PluginManager:
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
+            lookup_key = manifest.key or manifest.name
+            incumbent = winners.get(lookup_key)
+            if (
+                incumbent is not None
+                and incumbent.source == "bundled"
+                and incumbent.kind == "capability"
+                and manifest.source != "bundled"
+            ):
+                logger.warning(
+                    "Ignoring non-bundled override of trusted capability '%s'",
+                    lookup_key,
+                )
+                continue
+            winners[lookup_key] = manifest
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 

@@ -206,7 +206,8 @@ def persist_trusted_attachment_manifest(
     except (AttributeError, TypeError, ValueError):
         created_at = time.time()
     payload = {
-        "version": 2,
+        # Additive profile binding keeps version 1 rollback-readable.
+        "version": 1,
         "session_id": session_id,
         "profile": _profile_name(event),
         "platform": "feishu",
@@ -232,11 +233,13 @@ def _read_manifest(path: Path, session_id: str, profile_name: str) -> dict[str, 
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise AttachmentProvenanceError("trusted attachment manifest is malformed") from None
+    manifest_profile = payload.get("profile") if isinstance(payload, dict) else None
+    legacy_chatbot_manifest = manifest_profile is None and profile_name == "chatbot-agent"
     if (
         not isinstance(payload, dict)
-        or payload.get("version") != 2
+        or payload.get("version") != 1
         or payload.get("session_id") != session_id
-        or payload.get("profile") != profile_name
+        or (manifest_profile != profile_name and not legacy_chatbot_manifest)
         or payload.get("platform") != "feishu"
         or not isinstance(payload.get("attachments"), list)
     ):

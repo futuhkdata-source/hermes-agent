@@ -13,6 +13,8 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -45,6 +47,10 @@ _MAX_IMAGE_SIDE = 12_000
 _MAX_IMAGE_FILE_BYTES = 128 * 1024 * 1024
 _MAX_SOURCE_WORK_BYTES = 512 * 1024 * 1024
 _DEFAULT_OUTPUT_LIMIT = 8 * 1024 * 1024
+_MAX_EXTRACT_SECONDS = 300
+_EXTRACT_DEADLINE: ContextVar[float | None] = ContextVar(
+    "document_extract_deadline", default=None,
+)
 
 _GENERATED_IMAGE_RE = re.compile(
     r"^(?:"
@@ -180,6 +186,18 @@ def _read_capped_stream(handle: Any, limit: int) -> tuple[str, bool]:
     return payload.decode("utf-8", errors="replace"), size > limit or len(payload) > limit
 
 
+def _bounded_timeout(requested: int) -> int:
+    deadline = _EXTRACT_DEADLINE.get()
+    if deadline is None:
+        return requested
+    remaining = deadline - time.monotonic()
+    if remaining < 1.0:
+        raise DocumentExtractError(
+            "Adaptive document extraction exceeded its 300 second deadline"
+        )
+    return min(requested, max(1, int(remaining)))
+
+
 def _run(
     command: list[str],
     timeout: int = 60,
@@ -198,6 +216,7 @@ def _run(
         raise DocumentExtractError("Python document runner is not allowlisted")
     if not 1 <= int(output_limit) <= _MAX_IMAGE_FILE_BYTES:
         raise DocumentExtractError("Subprocess output limit is invalid")
+    timeout = _bounded_timeout(int(timeout))
     if not Path(PRLIMIT_BIN).is_file():
         raise DocumentExtractError("prlimit is required for document subprocess isolation")
 
@@ -444,7 +463,9 @@ def _run_paddle_ocr(
 ) -> tuple[subprocess.CompletedProcess[str], float]:
     paddle_env = _prepare_paddle_runtime(work)
     try:
-        with paddle_slot(_runtime_profile_name(), timeout=180.0) as waited:
+        with paddle_slot(
+            _runtime_profile_name(), timeout=float(_bounded_timeout(180)),
+        ) as waited:
             result = _run(
                 [PYTHON_BIN, str(PADDLE_RUNNER), str(image_path)],
                 240,
@@ -991,16 +1012,22 @@ def handle_document_extract(args: dict[str, Any], **kwargs: Any) -> str:
 
             extracted_pages: list[dict[str, Any]] = []
             paddle_pages_used = 0
-            for page in range(first, last + 1):
-                page_result = _extract_page_auto(
-                    session_id,
-                    page=page,
-                    dpi=dpi,
-                    paddle_allowed=paddle_pages_used < max_paddle_pages,
-                )
-                if bool(page_result.get("paddle_used")):
-                    paddle_pages_used += 1
-                extracted_pages.append(page_result)
+            deadline_token = _EXTRACT_DEADLINE.set(
+                time.monotonic() + _MAX_EXTRACT_SECONDS
+            )
+            try:
+                for page in range(first, last + 1):
+                    page_result = _extract_page_auto(
+                        session_id,
+                        page=page,
+                        dpi=dpi,
+                        paddle_allowed=paddle_pages_used < max_paddle_pages,
+                    )
+                    if bool(page_result.get("paddle_used")):
+                        paddle_pages_used += 1
+                    extracted_pages.append(page_result)
+            finally:
+                _EXTRACT_DEADLINE.reset(deadline_token)
 
             combined_raw = "\n\n".join(
                 f"[Page {page['page']}]\n{page.get('text') or ''}"

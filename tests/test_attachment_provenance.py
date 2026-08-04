@@ -61,7 +61,7 @@ def test_persist_and_resolve_exact_feishu_session_pdf(tmp_path):
     assert manifest.parent.name == "session-1"
     assert manifest.stat().st_mode & 0o777 == 0o600
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["version"] == 2
+    assert payload["version"] == 1
     assert payload["session_id"] == "session-1"
     assert payload["platform"] == "feishu"
     assert payload["profile"] == PROFILE
