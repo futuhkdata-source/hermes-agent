@@ -16,6 +16,9 @@ from gateway.attachment_provenance import (
 from gateway.config import Platform
 
 
+PROFILE = "chatbot-agent"
+
+
 def _pdf(root: Path, name: str = "doc_0123456789ab_sample.pdf") -> Path:
     documents = root / "cache" / "documents"
     documents.mkdir(parents=True, mode=0o700)
@@ -24,13 +27,27 @@ def _pdf(root: Path, name: str = "doc_0123456789ab_sample.pdf") -> Path:
     return path
 
 
-def _event(path: Path, *, platform=Platform.FEISHU, session_message="om_123"):
+def _event(
+    path: Path,
+    *,
+    platform=Platform.FEISHU,
+    session_message="om_123",
+    profile=PROFILE,
+):
     return SimpleNamespace(
-        source=SimpleNamespace(platform=platform),
+        source=SimpleNamespace(platform=platform, profile=profile),
         media_urls=[str(path)],
         media_types=["application/pdf"],
         message_id=session_message,
         timestamp=datetime.now(timezone.utc),
+    )
+
+
+def _resolve(session_id: str, root: Path, *, profile: str = PROFILE):
+    return resolve_trusted_pdf_attachment(
+        session_id,
+        profile_name=profile,
+        hermes_root=root,
     )
 
 
@@ -44,11 +61,13 @@ def test_persist_and_resolve_exact_feishu_session_pdf(tmp_path):
     assert manifest.parent.name == "session-1"
     assert manifest.stat().st_mode & 0o777 == 0o600
     payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
     assert payload["session_id"] == "session-1"
     assert payload["platform"] == "feishu"
+    assert payload["profile"] == PROFILE
     assert payload["attachments"][0]["path"] == str(source.resolve())
 
-    resolved = resolve_trusted_pdf_attachment("session-1", hermes_root=tmp_path)
+    resolved = _resolve("session-1", tmp_path)
     assert resolved["path"] == str(source.resolve())
     assert resolved["size"] == source.stat().st_size
     assert len(resolved["sha256"]) == 64
@@ -57,7 +76,7 @@ def test_persist_and_resolve_exact_feishu_session_pdf(tmp_path):
 def test_no_manifest_means_user_text_cannot_authorize_a_cache_path(tmp_path):
     _pdf(tmp_path)
     with pytest.raises(AttachmentProvenanceError, match="trusted attachment manifest"):
-        resolve_trusted_pdf_attachment("session-1", hermes_root=tmp_path)
+        _resolve("session-1", tmp_path)
 
 
 def test_persist_ignores_non_feishu_and_non_pdf_media(tmp_path):
@@ -75,7 +94,7 @@ def test_session_id_cannot_escape_manifest_root(tmp_path):
     with pytest.raises(AttachmentProvenanceError, match="session_id"):
         persist_trusted_attachment_manifest(_event(source), "../escape", hermes_root=tmp_path)
     with pytest.raises(AttachmentProvenanceError, match="session_id"):
-        resolve_trusted_pdf_attachment("../escape", hermes_root=tmp_path)
+        _resolve("../escape", tmp_path)
 
 
 def test_persist_rejects_path_escape_symlink_and_hardlink(tmp_path):
@@ -101,7 +120,7 @@ def test_resolver_rejects_source_tampering_after_manifest(tmp_path):
     persist_trusted_attachment_manifest(_event(source), "session-1", hermes_root=tmp_path)
     source.write_bytes(b"%PDF-1.4\nchanged\n%%EOF\n")
     with pytest.raises(AttachmentProvenanceError, match="digest"):
-        resolve_trusted_pdf_attachment("session-1", hermes_root=tmp_path)
+        _resolve("session-1", tmp_path)
 
 
 def test_resolver_rejects_manifest_symlink_or_world_writable_file(tmp_path):
@@ -112,4 +131,29 @@ def test_resolver_rejects_manifest_symlink_or_world_writable_file(tmp_path):
     assert manifest is not None
     manifest.chmod(0o666)
     with pytest.raises(AttachmentProvenanceError, match="permissions"):
-        resolve_trusted_pdf_attachment("session-1", hermes_root=tmp_path)
+        _resolve("session-1", tmp_path)
+
+
+def test_resolver_rejects_cross_profile_manifest_replay(tmp_path):
+    source = _pdf(tmp_path)
+    persist_trusted_attachment_manifest(
+        _event(source, profile=PROFILE),
+        "session-1",
+        hermes_root=tmp_path,
+    )
+
+    with pytest.raises(AttachmentProvenanceError, match="profile"):
+        _resolve("session-1", tmp_path, profile="hr-agent")
+
+
+def test_profile_name_is_required_and_validated(tmp_path):
+    source = _pdf(tmp_path)
+    event = _event(source, profile="../escape")
+    with pytest.raises(AttachmentProvenanceError, match="profile"):
+        persist_trusted_attachment_manifest(event, "session-1", hermes_root=tmp_path)
+
+    persist_trusted_attachment_manifest(_event(source), "session-1", hermes_root=tmp_path)
+    with pytest.raises(AttachmentProvenanceError, match="profile"):
+        resolve_trusted_pdf_attachment(
+            "session-1", profile_name="../escape", hermes_root=tmp_path,
+        )

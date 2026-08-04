@@ -12,6 +12,7 @@ from hermes_constants import get_default_hermes_root
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _INBOUND_PDF_RE = re.compile(r"^doc_[0-9a-fA-F]{12}_.+\.pdf$")
 _MANIFEST_RE = re.compile(r"^message-[0-9a-f]{24}\.json$")
 _MAX_MANIFEST_BYTES = 1 * 1024 * 1024
@@ -32,9 +33,20 @@ def _validate_session_id(session_id: str) -> str:
     return session_id
 
 
+def _validate_profile_name(profile_name: str) -> str:
+    if not isinstance(profile_name, str) or not _PROFILE_NAME_RE.fullmatch(profile_name):
+        raise AttachmentProvenanceError("runtime profile failed validation")
+    return profile_name
+
+
 def _platform_name(event: Any) -> str:
     platform = getattr(getattr(event, "source", None), "platform", None)
     return str(getattr(platform, "value", platform) or "").lower()
+
+
+def _profile_name(event: Any) -> str:
+    profile = str(getattr(getattr(event, "source", None), "profile", None) or "default")
+    return _validate_profile_name(profile)
 
 
 def _hash_pdf(path: Path) -> tuple[str, int]:
@@ -194,8 +206,9 @@ def persist_trusted_attachment_manifest(
     except (AttributeError, TypeError, ValueError):
         created_at = time.time()
     payload = {
-        "version": 1,
+        "version": 2,
         "session_id": session_id,
+        "profile": _profile_name(event),
         "platform": "feishu",
         "message_id_sha256": hashlib.sha256(message_id.encode()).hexdigest(),
         "created_at": created_at,
@@ -205,7 +218,7 @@ def persist_trusted_attachment_manifest(
     return path
 
 
-def _read_manifest(path: Path, session_id: str) -> dict[str, Any]:
+def _read_manifest(path: Path, session_id: str, profile_name: str) -> dict[str, Any]:
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
             raise AttachmentProvenanceError("trusted attachment manifest link is not allowed")
@@ -221,22 +234,25 @@ def _read_manifest(path: Path, session_id: str) -> dict[str, Any]:
         raise AttachmentProvenanceError("trusted attachment manifest is malformed") from None
     if (
         not isinstance(payload, dict)
-        or payload.get("version") != 1
+        or payload.get("version") != 2
         or payload.get("session_id") != session_id
+        or payload.get("profile") != profile_name
         or payload.get("platform") != "feishu"
         or not isinstance(payload.get("attachments"), list)
     ):
-        raise AttachmentProvenanceError("trusted attachment manifest identity failed validation")
+        raise AttachmentProvenanceError("trusted attachment manifest identity or profile failed validation")
     return payload
 
 
 def resolve_trusted_pdf_attachment(
     session_id: str,
     *,
+    profile_name: str,
     hermes_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Resolve the latest verified PDF from the exact runtime session manifest."""
+    """Resolve the latest verified PDF for one runtime session and profile."""
     session_id = _validate_session_id(session_id)
+    profile_name = _validate_profile_name(profile_name)
     root = _root(hermes_root)
     directory = _session_manifest_dir(root, session_id, create=False)
     manifests = sorted(
@@ -250,7 +266,7 @@ def resolve_trusted_pdf_attachment(
     if not manifests:
         raise AttachmentProvenanceError("no trusted attachment manifest exists for the runtime session")
     for manifest in manifests:
-        payload = _read_manifest(manifest, session_id)
+        payload = _read_manifest(manifest, session_id, profile_name)
         for record in reversed(payload["attachments"]):
             if not isinstance(record, dict):
                 continue

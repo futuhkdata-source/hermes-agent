@@ -1,0 +1,7 @@
+name: document-extract
+version: 2.0.0
+kind: standalone
+description: Profile-scoped, source-authorized PDF preprocessing and crop-first OCR.
+author: Harrison Lee / Hermes
+provides_tools:
+  - document_extract
