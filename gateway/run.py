@@ -8990,6 +8990,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        # Persist structured attachment provenance only after the gateway has
+        # resolved the exact runtime session. Tools must authorize from this
+        # manifest, never from user-controlled transcript annotations.
+        if getattr(event, "media_urls", None):
+            try:
+                from gateway.attachment_provenance import persist_trusted_attachment_manifest
+
+                persist_trusted_attachment_manifest(event, session_entry.session_id)
+            except Exception:
+                logger.warning(
+                    "Failed to persist trusted attachment provenance for session %s",
+                    session_entry.session_id,
+                    exc_info=True,
+                )
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
             try:
