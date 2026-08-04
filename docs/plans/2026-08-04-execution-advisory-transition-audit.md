@@ -1,6 +1,6 @@
 # P1-C.1 Bounded Advisory Decision-Transition Audit
 
-**Status:** bounded-remediation candidate implemented; focused re-check and production cutover pending.
+**Status:** live with `GO_P1C1_TRANSITION_AUDIT` on 2026-08-04 HKT; source commit `ab8df39efa0b669e9c9c92cf3a07d509966788e1`.
 
 ## Purpose
 
@@ -117,6 +117,17 @@ No second reviewer/remediation loop is permitted; the owner performs one focused
 6. Enable only the transition gate and run one Bearer-authenticated API Server canary using the owner-only profile credential.
 7. Verify one valid immutable transition, stable Gateway/Feishu/API Server health, and unchanged control boundaries.
 8. On failure, restore the config backup, leaving P1-C live and P1-C.1 off.
+
+## Live activation evidence
+
+- Final verdict: `GO_P1C1_TRANSITION_AUDIT` at 2026-08-04 05:18 HKT.
+- Source commit: `ab8df39efa0b669e9c9c92cf3a07d509966788e1`.
+- Restart proof: Gateway PID `186483` → `191606`.
+- Dark canary: P1-C sidecar created while P1-C.1 created zero transition records.
+- Active canary: one 674-byte `hermes.execution-advisory-transition.v1` immutable record with `NO_ACTION`; marker observed in the API response but absent from stored metadata.
+- Live boundaries: P1-C advisory and P1-C.1 transition gates are true; all six control effects are false; Gateway, Feishu, and API Server are connected.
+- Rollback config: `/home/ubuntu/.hermes/backups/p1c1-transition-cutover-20260804-051033-HKT/config.before.yaml`.
+- Cutover evidence: `/home/ubuntu/.hermes/backups/p1c1-transition-cutover-20260804-051033-HKT/cutover-result.json`.
 
 ## Explicitly out of scope
 
