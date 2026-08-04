@@ -364,6 +364,23 @@ class TestSkillsList:
 
 
 class TestSkillView:
+    def test_profile_runtime_scope_uses_active_home_after_module_import(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_home = tmp_path / "profiles" / "chatbot-agent"
+        skills_dir = profile_home / "skills"
+        _make_skill(skills_dir, "profile-only-skill")
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            view_result = json.loads(skill_view("profile-only-skill"))
+            list_result = json.loads(skills_list())
+        finally:
+            reset_hermes_home_override(token)
+
+        assert view_result["success"] is True
+        assert view_result["name"] == "profile-only-skill"
+        assert "profile-only-skill" in {item["name"] for item in list_result["skills"]}
+
     def test_view_existing_skill(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "my-skill")
